@@ -1,0 +1,7 @@
+# This project intentionally depends on the Python standard library only.
+# There are no third-party runtime dependencies to install.
+#
+# Required: Python 3.9 or newer (tested with Python 3.13).
+#
+# Optional (installed automatically when needed, not through pip):
+#   cloudflared  - downloaded by server.py / start_server.bat into bin/

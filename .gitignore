@@ -1,0 +1,11 @@
+# Local runtime artifacts
+bin/cloudflared.exe
+logs/
+downloads/*
+!downloads/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
