@@ -1,5 +1,4 @@
 # Local runtime artifacts
-bin/cloudflared.exe
 logs/
 downloads/*
 !downloads/.gitkeep
