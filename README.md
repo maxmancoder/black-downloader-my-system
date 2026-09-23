@@ -1,4 +1,4 @@
-# Black Downloader My System
+# Black Server My System
 
 یک سرور دانلود فایل عمومی برای ویندوز — بدون نیاز به هیچ تنظیم شبکه، پورت فوروارد، یا آدرس IP ثابت.
 فایل `start_server.bat` را دابل‌کلیک کنید تا پوشه `downloads` شما به یک لینک عمومی تبدیل شود.
