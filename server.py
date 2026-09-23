@@ -918,10 +918,11 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
         if current != root:
             rows.append(
                 '<a class="card dir" href="../">'
-                '<span class="icon">&#8617;</span>'
-                '<span class="name">.. (parent)</span>'
-                '<span class="size"></span>'
-                "</a>"
+                '<div class="card-icon">&#8617;</div>'
+                '<div class="card-body">'
+                '<div class="card-name">.. (parent)</div>'
+                '<div class="card-meta">Back to parent folder</div>'
+                "</div></a>"
             )
 
         for name in entries:
@@ -931,10 +932,11 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             if full.is_dir():
                 rows.append(
                     f'<a class="card dir" href="{link}/">'
-                    f'<span class="icon">&#128193;</span>'
-                    f'<span class="name">{label}</span>'
-                    '<span class="size">&mdash;</span>'
-                    "</a>"
+                    f'<div class="card-icon">&#128193;</div>'
+                    f'<div class="card-body">'
+                    f'<div class="card-name">{label}</div>'
+                    f'<div class="card-meta">Folder</div>'
+                    "</div></a>"
                 )
             else:
                 try:
@@ -943,19 +945,22 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
                     size = "?"
                 ext = full.suffix.lower()
                 icon = _file_icon(ext)
+                type_label = ext.lstrip(".").upper() + " file" if ext else "File"
                 rows.append(
                     f'<a class="card file" href="{link}" download>'
-                    f'<span class="icon">{icon}</span>'
-                    f'<span class="name">{label}</span>'
-                    f'<span class="size">{size}</span>'
-                    '<span class="dl">&#8595;</span>'
+                    f'<div class="card-icon">{icon}</div>'
+                    f'<div class="card-body">'
+                    f'<div class="card-name">{label}</div>'
+                    f'<div class="card-meta">{type_label} &middot; {size}</div>'
+                    "</div>"
+                    f'<div class="card-dl"><span>&#8595;</span></div>'
                     "</a>"
                 )
 
         if rows:
             body_rows = "\n".join(rows)
         else:
-            body_rows = '<div class="empty">No files available.</div>'
+            body_rows = '<div class="empty">&#128196; No files available.</div>'
 
         page = f"""<!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -968,43 +973,47 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   *,*::before,*::after {{ box-sizing:border-box; margin:0; padding:0; }}
 
   :root, [data-theme="dark"] {{
-    --bg: #0a0a0f;
+    --bg: #09090f;
     --bg2: #111118;
-    --glass: rgba(255,255,255,.06);
-    --glass2: rgba(255,255,255,.10);
-    --glass-hover: rgba(255,255,255,.14);
-    --border: rgba(255,255,255,.10);
-    --border-hover: rgba(255,255,255,.22);
-    --text: #f2f2f7;
+    --glass: rgba(255,255,255,.055);
+    --glass2: rgba(255,255,255,.09);
+    --glass3: rgba(255,255,255,.13);
+    --glass-hover: rgba(255,255,255,.12);
+    --border: rgba(255,255,255,.08);
+    --border-hover: rgba(255,255,255,.20);
+    --text: #f5f5f7;
     --text2: #8e8e93;
     --accent: #0a84ff;
     --accent2: #5e5ce6;
     --green: #30d158;
     --orange: #ff9f0a;
-    --shadow: 0 8px 32px rgba(0,0,0,.45);
-    --shadow-hover: 0 12px 40px rgba(10,132,255,.25);
-    --radius: 16px;
-    --blur: 24px;
+    --pink: #ff375f;
+    --shadow: 0 4px 24px rgba(0,0,0,.4);
+    --shadow-hover: 0 8px 32px rgba(10,132,255,.3);
+    --radius: 18px;
+    --blur: 28px;
   }}
 
   [data-theme="light"] {{
     --bg: #f2f2f7;
     --bg2: #ffffff;
-    --glass: rgba(255,255,255,.72);
-    --glass2: rgba(255,255,255,.88);
+    --glass: rgba(255,255,255,.70);
+    --glass2: rgba(255,255,255,.85);
+    --glass3: rgba(255,255,255,.92);
     --glass-hover: rgba(255,255,255,.95);
-    --border: rgba(0,0,0,.08);
-    --border-hover: rgba(0,0,0,.18);
+    --border: rgba(0,0,0,.07);
+    --border-hover: rgba(0,0,0,.16);
     --text: #1c1c1e;
     --text2: #6e6e73;
     --accent: #007aff;
     --accent2: #5856d6;
     --green: #28a745;
     --orange: #ff9500;
-    --shadow: 0 4px 24px rgba(0,0,0,.10);
-    --shadow-hover: 0 8px 32px rgba(0,122,255,.22);
-    --radius: 16px;
-    --blur: 24px;
+    --pink: #ff2d55;
+    --shadow: 0 2px 16px rgba(0,0,0,.08);
+    --shadow-hover: 0 8px 28px rgba(0,122,255,.18);
+    --radius: 18px;
+    --blur: 28px;
   }}
 
   html {{ font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
@@ -1015,7 +1024,6 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     background: var(--bg);
     color: var(--text);
     min-height: 100vh;
-    padding: 1.5rem;
     transition: background .4s, color .4s;
   }}
 
@@ -1023,207 +1031,298 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     content: "";
     position: fixed; inset: 0;
     background:
-      radial-gradient(ellipse 80% 50% at 20% 0%, rgba(10,132,255,.15), transparent),
-      radial-gradient(ellipse 60% 40% at 80% 100%, rgba(94,92,230,.12), transparent);
-    pointer-events: none;
-    z-index: 0;
+      radial-gradient(ellipse 70% 40% at 15% 0%, rgba(10,132,255,.18), transparent),
+      radial-gradient(ellipse 50% 35% at 85% 100%, rgba(94,92,230,.14), transparent),
+      radial-gradient(ellipse 40% 30% at 50% 50%, rgba(255,55,95,.06), transparent);
+    pointer-events: none; z-index: 0;
   }}
   [data-theme="light"] body::before {{
     background:
-      radial-gradient(ellipse 80% 50% at 20% 0%, rgba(0,122,255,.08), transparent),
-      radial-gradient(ellipse 60% 40% at 80% 100%, rgba(88,86,214,.06), transparent);
+      radial-gradient(ellipse 70% 40% at 15% 0%, rgba(0,122,255,.10), transparent),
+      radial-gradient(ellipse 50% 35% at 85% 100%, rgba(88,86,214,.08), transparent);
   }}
 
-  .wrap {{
+  /* ===== FILE MANAGER SHELL ===== */
+  .fm {{
     position: relative; z-index: 1;
-    max-width: 720px; margin: 0 auto;
-  }}
-
-  /* ---- header ---- */
-  .header {{
-    display: flex; align-items: center; justify-content: space-between;
-    margin-bottom: 1.5rem;
-  }}
-  .header h1 {{
-    font-size: 1.5rem; font-weight: 700; letter-spacing: -.02em;
-  }}
-  .path {{
-    color: var(--text2); font-size: .82rem; margin-bottom: 1.5rem;
-    word-break: break-all; font-weight: 500;
-    padding: .6rem .9rem;
+    max-width: 860px; margin: 2rem auto;
     background: var(--glass);
     border: 1px solid var(--border);
-    border-radius: 12px;
+    border-radius: 24px;
+    backdrop-filter: blur(var(--blur));
+    -webkit-backdrop-filter: blur(var(--blur));
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    animation: shellIn .5s cubic-bezier(.16,1,.3,1) both;
+  }}
+
+  /* ---- toolbar ---- */
+  .toolbar {{
+    display: flex; align-items: center; gap: .75rem;
+    padding: .85rem 1.1rem;
+    background: var(--glass2);
+    border-bottom: 1px solid var(--border);
     backdrop-filter: blur(var(--blur));
     -webkit-backdrop-filter: blur(var(--blur));
   }}
+  .traffic {{
+    display: flex; gap: 7px; flex-shrink: 0;
+  }}
+  .traffic span {{
+    width: 13px; height: 13px; border-radius: 50%;
+    display: inline-block;
+  }}
+  .traffic .r {{ background: #ff5f57; }}
+  .traffic .y {{ background: #febc2e; }}
+  .traffic .g {{ background: #28c840; }}
+  .toolbar-title {{
+    font-weight: 600; font-size: .95rem; letter-spacing: -.01em;
+    flex: 1; text-align: center;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }}
+  .toolbar-actions {{ display: flex; gap: .5rem; flex-shrink: 0; }}
 
-  /* ---- theme toggle ---- */
-  .theme-btn {{
-    width: 44px; height: 44px; border-radius: 50%;
+  .btn-icon {{
+    width: 34px; height: 34px; border-radius: 10px;
     border: 1px solid var(--border);
     background: var(--glass);
-    backdrop-filter: blur(var(--blur));
-    -webkit-backdrop-filter: blur(var(--blur));
-    color: var(--text);
-    font-size: 1.15rem; cursor: pointer;
+    color: var(--text); font-size: .95rem; cursor: pointer;
     display: flex; align-items: center; justify-content: center;
-    transition: all .3s cubic-bezier(.4,0,.2,1);
-    flex-shrink: 0;
+    transition: all .25s cubic-bezier(.4,0,.2,1);
   }}
-  .theme-btn:hover {{
+  .btn-icon:hover {{
     background: var(--glass-hover);
     border-color: var(--border-hover);
-    transform: scale(1.08) rotate(15deg);
-    box-shadow: var(--shadow-hover);
+    transform: scale(1.06);
   }}
-  .theme-btn:active {{ transform: scale(.95); }}
+  .btn-icon:active {{ transform: scale(.94); }}
 
-  /* ---- file cards ---- */
-  .cards {{
-    display: flex; flex-direction: column; gap: .6rem;
+  /* ---- breadcrumb path ---- */
+  .pathbar {{
+    padding: .55rem 1.2rem;
+    background: var(--glass);
+    border-bottom: 1px solid var(--border);
+    font-size: .78rem; color: var(--text2);
+    font-weight: 500; word-break: break-all;
+    display: flex; align-items: center; gap: .4rem;
+  }}
+  .pathbar .dot {{
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent); flex-shrink: 0;
+  }}
+
+  /* ---- content area ---- */
+  .content {{
+    padding: 1.1rem;
+    min-height: 300px;
+  }}
+
+  /* ===== FILE CARDS GRID ===== */
+  .grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: .8rem;
   }}
 
   .card {{
-    display: flex; align-items: center; gap: .9rem;
-    padding: .9rem 1.1rem;
-    background: var(--glass);
+    display: flex; flex-direction: column;
+    align-items: center; text-align: center;
+    padding: 1.2rem .8rem 1rem;
+    background: var(--glass2);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    backdrop-filter: blur(var(--blur));
-    -webkit-backdrop-filter: blur(var(--blur));
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
     text-decoration: none; color: var(--text);
-    transition: all .25s cubic-bezier(.4,0,.2,1);
-    position: relative;
-    overflow: hidden;
+    transition: all .3s cubic-bezier(.16,1,.3,1);
+    position: relative; overflow: hidden;
+    cursor: pointer;
+    animation: cardIn .45s cubic-bezier(.16,1,.3,1) both;
   }}
+
+  /* subtle shine sweep on hover */
   .card::before {{
     content: "";
-    position: absolute; inset: 0;
-    background: linear-gradient(135deg, rgba(255,255,255,.06), transparent 60%);
-    opacity: 0; transition: opacity .3s;
+    position: absolute; top: -50%; left: -50%;
+    width: 200%; height: 200%;
+    background: linear-gradient(
+      45deg, transparent 40%,
+      rgba(255,255,255,.06) 50%,
+      transparent 60%);
+    transform: translateX(-100%);
+    transition: transform .6s ease;
     pointer-events: none;
   }}
+  .card:hover::before {{ transform: translateX(100%); }}
+
   .card:hover {{
     background: var(--glass-hover);
     border-color: var(--border-hover);
-    transform: translateY(-2px) scale(1.01);
+    transform: translateY(-6px) scale(1.03);
     box-shadow: var(--shadow-hover);
   }}
-  .card:hover::before {{ opacity: 1; }}
-  .card:active {{ transform: translateY(0) scale(.99); }}
+  .card:active {{ transform: translateY(-2px) scale(1.01); }}
 
-  .card .icon {{
-    font-size: 1.4rem; width: 36px; height: 36px;
+  /* ---- card icon ---- */
+  .card-icon {{
+    font-size: 2.4rem; line-height: 1;
+    margin-bottom: .7rem;
+    width: 64px; height: 64px;
     display: flex; align-items: center; justify-content: center;
-    background: var(--glass2);
-    border-radius: 10px;
+    background: var(--glass3);
     border: 1px solid var(--border);
-    flex-shrink: 0;
-    transition: all .3s;
+    border-radius: 18px;
+    transition: all .35s cubic-bezier(.16,1,.3,1);
+    position: relative;
   }}
-  .card:hover .icon {{
+  .card:hover .card-icon {{
     background: var(--accent);
     border-color: var(--accent);
-    color: #fff;
-    transform: scale(1.1);
+    transform: scale(1.12) rotate(-4deg);
+    box-shadow: 0 6px 20px rgba(10,132,255,.35);
   }}
-  .card.dir:hover .icon {{
+  .card.dir:hover .card-icon {{
     background: var(--orange);
     border-color: var(--orange);
+    box-shadow: 0 6px 20px rgba(255,159,10,.35);
   }}
 
-  .card .name {{
-    flex: 1; font-weight: 500; font-size: .92rem;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  /* ---- card text ---- */
+  .card-body {{ width: 100%; min-width: 0; }}
+
+  .card-name {{
+    font-weight: 600; font-size: .82rem; line-height: 1.3;
+    overflow: hidden; text-overflow: ellipsis;
+    display: -webkit-box; -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    margin-bottom: .3rem;
     transition: color .2s;
+    word-break: break-word;
   }}
-  .card:hover .name {{ color: var(--accent); }}
-  .card.dir:hover .name {{ color: var(--orange); }}
+  .card:hover .card-name {{ color: var(--accent); }}
+  .card.dir:hover .card-name {{ color: var(--orange); }}
 
-  .card .size {{
-    color: var(--text2); font-size: .78rem; font-weight: 600;
-    font-variant-numeric: tabular-nums;
-    background: var(--glass2);
-    padding: .2rem .55rem;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    transition: all .3s;
-    flex-shrink: 0;
-  }}
-  .card:hover .size {{
-    background: var(--accent);
-    color: #fff;
-    border-color: var(--accent);
+  .card-meta {{
+    font-size: .68rem; color: var(--text2);
+    font-weight: 500; letter-spacing: .01em;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }}
 
-  .card .dl {{
-    font-size: 1.1rem; color: var(--text2);
-    opacity: 0; transform: translateX(-8px);
-    transition: all .3s cubic-bezier(.4,0,.2,1);
-    flex-shrink: 0; width: 20px; text-align: center;
+  /* ---- download badge (appears on hover) ---- */
+  .card-dl {{
+    position: absolute; top: .55rem; right: .55rem;
+    width: 28px; height: 28px;
+    background: var(--green);
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    opacity: 0; transform: scale(.5);
+    transition: all .3s cubic-bezier(.16,1,.3,1);
+    box-shadow: 0 2px 8px rgba(48,209,88,.4);
   }}
-  .card:hover .dl {{
-    opacity: 1; transform: translateX(0);
-    color: var(--green);
+  .card-dl span {{
+    color: #fff; font-size: .85rem; font-weight: 700;
+    line-height: 1;
   }}
+  .card:hover .card-dl {{
+    opacity: 1; transform: scale(1);
+  }}
+  .card.dir .card-dl {{ display: none; }}
 
+  /* ---- empty state ---- */
   .empty {{
     text-align: center; color: var(--text2);
-    padding: 3rem 1rem; font-size: .95rem;
-    background: var(--glass);
-    border: 1px dashed var(--border);
+    padding: 4rem 1rem; font-size: 1rem;
+    font-weight: 500;
+    background: var(--glass2);
+    border: 2px dashed var(--border);
     border-radius: var(--radius);
-    backdrop-filter: blur(var(--blur));
+    grid-column: 1 / -1;
   }}
 
-  footer {{
-    margin-top: 1.5rem; text-align: center;
-    color: var(--text2); font-size: .72rem; font-weight: 500;
-    opacity: .7;
+  /* ---- status bar ---- */
+  .statusbar {{
+    display: flex; align-items: center; justify-content: space-between;
+    padding: .55rem 1.1rem;
+    background: var(--glass2);
+    border-top: 1px solid var(--border);
+    font-size: .7rem; color: var(--text2); font-weight: 500;
+  }}
+  .statusbar .badge {{
+    background: var(--accent);
+    color: #fff; padding: .15rem .5rem;
+    border-radius: 6px; font-size: .65rem;
+    font-weight: 700;
   }}
 
-  /* ---- responsive ---- */
-  @media (max-width: 480px) {{
-    body {{ padding: .75rem; }}
-    .header h1 {{ font-size: 1.2rem; }}
-    .card {{ padding: .75rem .85rem; gap: .7rem; }}
-    .card .icon {{ width: 32px; height: 32px; font-size: 1.15rem; }}
-    .card .name {{ font-size: .84rem; }}
+  /* ===== ANIMATIONS ===== */
+  @keyframes shellIn {{
+    from {{ opacity: 0; transform: translateY(20px) scale(.98); }}
+    to {{ opacity: 1; transform: translateY(0) scale(1); }}
   }}
+  @keyframes cardIn {{
+    from {{ opacity: 0; transform: translateY(14px) scale(.96); }}
+    to {{ opacity: 1; transform: translateY(0) scale(1); }}
+  }}
+  .card:nth-child(1)  {{ animation-delay: .03s; }}
+  .card:nth-child(2)  {{ animation-delay: .06s; }}
+  .card:nth-child(3)  {{ animation-delay: .09s; }}
+  .card:nth-child(4)  {{ animation-delay: .12s; }}
+  .card:nth-child(5)  {{ animation-delay: .15s; }}
+  .card:nth-child(6)  {{ animation-delay: .18s; }}
+  .card:nth-child(7)  {{ animation-delay: .21s; }}
+  .card:nth-child(8)  {{ animation-delay: .24s; }}
+  .card:nth-child(9)  {{ animation-delay: .27s; }}
+  .card:nth-child(10) {{ animation-delay: .30s; }}
+  .card:nth-child(11) {{ animation-delay: .33s; }}
+  .card:nth-child(12) {{ animation-delay: .36s; }}
 
-  /* ---- entrance animation ---- */
-  .card {{ animation: fadeUp .4s ease both; }}
-  .card:nth-child(1) {{ animation-delay: .02s; }}
-  .card:nth-child(2) {{ animation-delay: .05s; }}
-  .card:nth-child(3) {{ animation-delay: .08s; }}
-  .card:nth-child(4) {{ animation-delay: .11s; }}
-  .card:nth-child(5) {{ animation-delay: .14s; }}
-  .card:nth-child(6) {{ animation-delay: .17s; }}
-  .card:nth-child(7) {{ animation-delay: .20s; }}
-  .card:nth-child(8) {{ animation-delay: .23s; }}
-  .card:nth-child(9) {{ animation-delay: .26s; }}
-  .card:nth-child(10) {{ animation-delay: .29s; }}
-
-  @keyframes fadeUp {{
-    from {{ opacity: 0; transform: translateY(12px); }}
-    to {{ opacity: 1; transform: translateY(0); }}
+  /* ===== RESPONSIVE ===== */
+  @media (max-width: 560px) {{
+    .fm {{ margin: .75rem; border-radius: 20px; }}
+    .grid {{ grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: .6rem; }}
+    .content {{ padding: .8rem; }}
+    .card {{ padding: 1rem .6rem .8rem; border-radius: 14px; }}
+    .card-icon {{ width: 52px; height: 52px; font-size: 1.9rem; border-radius: 14px; }}
+    .card-name {{ font-size: .76rem; }}
+    .traffic {{ display: none; }}
+    .toolbar-title {{ text-align: left; }}
   }}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <div class="header">
-    <h1>&#9679; Black Server</h1>
-    <button class="theme-btn" id="themeBtn" title="Toggle theme"
-            onclick="toggleTheme()">&#127769;</button>
+<div class="fm">
+  <!-- toolbar (macOS Finder style) -->
+  <div class="toolbar">
+    <div class="traffic">
+      <span class="r"></span><span class="y"></span><span class="g"></span>
+    </div>
+    <div class="toolbar-title">&#9679; Black Server</div>
+    <div class="toolbar-actions">
+      <button class="btn-icon" id="themeBtn" title="Toggle theme"
+              onclick="toggleTheme()">&#127769;</button>
+    </div>
   </div>
-  <div class="path">{html.escape(display_path)}</div>
-  <div class="cards">
+
+  <!-- breadcrumb path -->
+  <div class="pathbar">
+    <span class="dot"></span>
+    {html.escape(display_path)}
+  </div>
+
+  <!-- file grid -->
+  <div class="content">
+    <div class="grid">
 {body_rows}
+    </div>
   </div>
-  <footer>Served via Black Server &middot; read-only</footer>
+
+  <!-- status bar -->
+  <div class="statusbar">
+    <span>{len(entries)} item{'s' if len(entries) != 1 else ''}</span>
+    <span class="badge">read-only</span>
+  </div>
 </div>
+
 <script>
 (function(){{
   var t = localStorage.getItem('bs-theme');
