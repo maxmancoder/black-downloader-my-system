@@ -94,18 +94,44 @@ TUNNEL_FATAL_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
-# --- SSH fallback tunnel (localhost.run) -------------------------------------
-# Used automatically when Cloudflare is blocked (e.g. national filters).  It
-# only needs an outbound SSH connection to port 22, which far fewer networks
-# block.  The service is free and account-less: it gives a public
-# ``https://<host>.lhr.life`` URL that forwards to our local port.
-LOCALHOST_RUN_HOST: str = "localhost.run"
-LOCALHOST_RUN_PORT: int = 22
-SSH_URL_RE: re.Pattern[str] = re.compile(r"https://[a-zA-Z0-9-]+\.lhr\.life")
-SSH_MARKER_SENTINEL: str = "lhr.life"   # appears on lines that announce the URL
+# --- SSH fallback tunnel providers -------------------------------------------
+# Used automatically when Cloudflare is blocked (e.g. national filters).
+# Each provider only needs an outbound SSH connection; the URL regex and
+# command differ per provider.  Providers are tried in order until one works.
 SSH_STARTUP_TIMEOUT: float = 45.0
 SSH_REACH_TRIES: int = 6
 SSH_REACH_DELAY: float = 4.0
+
+
+def _ssh_cmd(dest: str, port: int, remote_port: str = "80") -> list:
+    """Build a standard SSH reverse-tunnel command."""
+    return [
+        "ssh",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ServerAliveInterval=5",
+        "-o", "ServerAliveCountMax=3",
+        "-o", "ExitOnForwardFailure=yes",
+        "-R", f"{remote_port}:127.0.0.1:{port}",
+        dest,
+        "-p", "22",
+    ]
+
+
+# Ordered list of SSH tunnel providers (tried first → last).
+SSH_PROVIDERS: list[dict] = [
+    {
+        "name": "localhost.run",
+        "log_name": "localhostrun.log",
+        "url_re": re.compile(r"https://[a-zA-Z0-9-]+\.lhr\.life"),
+        "cmd": lambda port: _ssh_cmd("nokey@localhost.run", port),
+    },
+    {
+        "name": "serveo.net",
+        "log_name": "serveo.log",
+        "url_re": re.compile(r"https://[a-zA-Z0-9.-]+\.serveousercontent\.com"),
+        "cmd": lambda port: _ssh_cmd("serveo.net", port),
+    },
+]
 
 # ANSI escape sequences that cloudflared uses to colour its log output.
 ANSI_RE: re.Pattern[str] = re.compile(r"\x1b\[[0-9;]*m")
@@ -514,25 +540,17 @@ class CloudflareTunnel:
 
 
 class SshTunnel:
-    """A public reverse tunnel borrowed over SSH (localhost.run).
+    """A public reverse tunnel borrowed over SSH.
 
     Used as an automatic fallback when Cloudflare is unreachable.  Works with
-    nothing but an outbound SSH connection:
-
-    * localhost.run (free, no account)::
-
-          ssh -R 80:127.0.0.1:<port> nokey@localhost.run -p 22
-
-      prints ``https://<host>.lhr.life``, a public URL that forwards all web
-      requests back through the SSH session to our local file server.
+    nothing but an outbound SSH connection to a free provider.  The provider
+    config (command builder + URL regex) is passed in from ``SSH_PROVIDERS``.
     """
 
-    def __init__(self, port: int, log_path: Path, host: str = LOCALHOST_RUN_HOST,
-                 ssh_port: int = LOCALHOST_RUN_PORT) -> None:
+    def __init__(self, port: int, log_path: Path, provider: dict) -> None:
         self.port = port
         self.log_path = log_path
-        self.host = host
-        self.ssh_port = ssh_port
+        self.provider = provider
         self.process: Optional[subprocess.Popen] = None
         self.public_url: Optional[str] = None
         self.reachable = False          # URL served our local content (verified)
@@ -540,17 +558,7 @@ class SshTunnel:
         self._url_event = threading.Event()
 
     def _command(self) -> list:
-        remote = f"80:127.0.0.1:{self.port}"
-        return [
-            "ssh",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "ServerAliveInterval=5",
-            "-o", "ServerAliveCountMax=3",
-            "-o", "ExitOnForwardFailure=yes",
-            "-R", remote,
-            "nokey@" + self.host,
-            "-p", str(self.ssh_port),
-        ]
+        return self.provider["cmd"](self.port)
 
     def start(self) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -575,7 +583,7 @@ class SshTunnel:
     def _poll_for_url(self) -> None:
         """Watch the log file for the public URL (ssh writes to a file on Windows)."""
         deadline = time.monotonic() + SSH_STARTUP_TIMEOUT
-        url_re = SSH_URL_RE
+        url_re = self.provider["url_re"]
         while time.monotonic() < deadline:
             if self.process is not None and self.process.poll() is not None:
                 break
@@ -650,25 +658,31 @@ def wait_reachable(url: str, tries: int = SSH_REACH_TRIES,
 
 def try_ssh_fallback(port: int, timeout: float = SSH_STARTUP_TIMEOUT,
                      reason: str = "") -> Tuple[Optional[SshTunnel], Optional[str]]:
-    """Bring up the localhost.run SSH tunnel and return ``(tunnel, url)``."""
+    """Try each SSH provider in order; return the first working ``(tunnel, url)``."""
     if reason:
         print(f"[i] {reason}")
-    print("[..] Starting the SSH fallback tunnel (localhost.run) ...")
-    ssh = SshTunnel(port, LOGS_DIR / "localhostrun.log")
-    try:
-        ssh.start()
-    except OSError as exc:
-        print(f"[ERROR] Could not start ssh: {exc}")
-        return None, None
-    public_url = ssh.wait_for_url(timeout)
-    if not public_url:
-        print("[ERROR] The SSH tunnel started but no public URL was returned.")
-        print("        Last tunnel messages:")
-        print_log_tail(ssh.log_path)
-        print(f"        See logs/{ssh.log_path.name} for details.")
+
+    for provider in SSH_PROVIDERS:
+        name = provider["name"]
+        print(f"[..] Trying SSH tunnel provider: {name} ...")
+        ssh = SshTunnel(port, LOGS_DIR / provider["log_name"], provider)
+        try:
+            ssh.start()
+        except OSError as exc:
+            print(f"    [!] Could not start ssh ({name}): {exc}")
+            continue
+
+        public_url = ssh.wait_for_url(timeout)
+        if public_url:
+            print(f"    [OK] {name} gave URL: {public_url}")
+            return ssh, public_url
+
+        # No URL — try next provider.
+        print(f"    [!] {name} did not give a URL in {int(timeout)}s.")
         ssh.stop()
-        return None, None
-    return ssh, public_url
+
+    print("[ERROR] All SSH tunnel providers failed.")
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -685,7 +699,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
       * only GET/HEAD are implemented - there is no upload or admin API.
     """
 
-    server_version = "BlackDownloader/1.0"
+    server_version = "BlackServer/1.0"
     protocol_version = "HTTP/1.1"
 
     # -- logging ----------------------------------------------------------
@@ -900,7 +914,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>Black Downloader - {html.escape(display_path)}</title>
+<title>Black Server - {html.escape(display_path)}</title>
 <style>
   :root {{ color-scheme: dark; }}
   body {{ font-family: "Segoe UI", system-ui, sans-serif; background:#0f1115;
@@ -981,7 +995,7 @@ def print_banner(
     public_line = public_url or "(tunnel disabled)"
     print()
     print("========================================")
-    print("      BLACK DOWNLOADER MY SYSTEM")
+    print("      BLACK SERVER MY SYSTEM")
     print("========================================")
     print()
     print("Local:")
@@ -1195,7 +1209,7 @@ def run(args: argparse.Namespace) -> int:
             if not banner_shown and online_url:
                 banner_shown = True
                 if ssh_tunnel is not None:
-                    print(f"[i] Public URL (via localhost.run SSH fallback): {online_url}")
+                    print(f"[i] Public URL (via SSH fallback): {online_url}")
                 print_banner(local_url, online_url, DOWNLOADS_DIR)
                 if copy_to_clipboard(online_url):
                     print("[OK] Public URL copied to the clipboard.")
@@ -1242,7 +1256,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Public file download server - Cloudflare Quick Tunnel with an "
-            "automatic localhost.run SSH fallback when Cloudflare is blocked."
+            "automatic SSH fallback tunnel when Cloudflare is blocked."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -1272,7 +1286,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--no-ssh-fallback", action="store_true",
-        help="disable the automatic localhost.run SSH fallback tunnel",
+        help="disable the automatic SSH fallback tunnel",
     )
     parser.add_argument(
         "--ssh-timeout", type=int, default=int(SSH_STARTUP_TIMEOUT),

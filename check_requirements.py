@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Black Downloader My System - Requirements checker.
+"""Black Server My System - Requirements checker.
 
 Checks if all requirements are met before launching the main server.
 If anything is missing, opens a visible CMD window with large
@@ -102,7 +102,7 @@ def open_install_window() -> None:
     # Build the batch script content
     bat_lines = [
         "@echo off",
-        "title Black Downloader My System - Installing Requirements",
+        "title Black Server My System - Installing Requirements",
         "color 0F",
         "cls",
         "",
@@ -111,7 +111,7 @@ def open_install_window() -> None:
         "echo.",
         "echo       DOWNLOADING REQUIREMENTS",
         "echo.",
-        "echo       Black Downloader My System needs the following:",
+        "echo       Black Server My System needs the following:",
         "echo.",
         "echo       - Python 3.9 or newer",
         "echo       - cloudflared.exe (Cloudflare tunnel client)",
@@ -180,7 +180,7 @@ def open_install_window() -> None:
         "",
         "echo  ============================================================",
         "echo    All requirements are installed!",
-        "echo    Launching Black Downloader My System ...",
+        "echo    Launching Black Server My System ...",
         "echo  ============================================================",
         "echo.",
         "timeout /t 2 >nul",

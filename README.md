@@ -11,7 +11,7 @@ no router configuration needed. Double-click `start_server.bat` and your
 Internet
    |
    v
-Cloudflare Quick Tunnel / SSH Fallback  (cloudflared / localhost.run)
+Cloudflare Quick Tunnel / SSH Fallback  (cloudflared / localhost.run / serveo)
    |
    v
 127.0.0.1:8080                           (local file server)
@@ -89,8 +89,9 @@ start_server.bat --no-browser
 | پورت اشغال است | سرور خودکار پورت جایگزین انتخاب می‌کند |
 | "Another instance is running" | پنجره دیگر را ببندید یا فایل `logs/server.lock` را حذف کنید |
 | لینک عمومی نمایش داده نمی‌شود | `logs/cloudflared.log` را بررسی کنید؛ اینترنت را چک کنید |
-| لینک رزرو شده ولی 530 می‌دهد | شبکه شما ترافیک cloudflared را بلاک می‌کند. `--protocol http2` را امتحان کنید |
-| SSH fallback کار نمی‌کند | اتصال SSH به port 22 توسط ISP بلاک شده. از VPN full-tunnel استفاده کنید |
+| لینک رزرو شده ولی 530 می‌دهد | شبکه شما ترافیک cloudflared را بلاک می‌کند. خودکار به SSH fallback می‌رود |
+| SSH fallback کار نمی‌کند | هر دو provider (localhost.run + serveo) امتحان می‌شوند. اگر هیچکدام کار نکرد، ISP شما SSH را بلاک کرده — از VPN full-tunnel استفاده کنید |
+| لینک عمومی کار نمی‌کند روی دستگاه دیگر | لینک Cloudflare موقتی است و با هر بار restart عوض می‌شود. لینک جدید را دوباره بفرستید |
 
 ### امنیت
 
@@ -133,7 +134,7 @@ project/
 - Streaming downloads (files are never loaded fully into RAM).
 - HTTP Range support, so large downloads can be resumed.
 - Automatic `cloudflared.exe` download when it is missing.
-- Automatic SSH fallback (`localhost.run`) when Cloudflare is blocked.
+- Automatic SSH fallback (localhost.run + serveo.net) when Cloudflare is blocked.
 - Single-instance protection, clean shutdown, no orphan processes.
 - Logs in `logs/server.log` and `logs/cloudflared.log`.
 
@@ -196,8 +197,9 @@ start_server.bat --no-browser
 | Port already in use             | The server automatically picks a free port.                |
 | "Another instance is running"   | Stop the other window, or delete `logs/server.lock`.       |
 | No public URL appears           | Check `logs/cloudflared.log`; verify your internet works.  |
-| URL reserved but link returns error/530 | Your network blocks `cloudflared` traffic (UDP/TCP port `7844`). Try `--protocol http2`. |
-| SSH fallback not working        | Your ISP blocks SSH to port 22. Use a full-tunnel VPN.     |
+| URL reserved but link returns error/530 | Your network blocks `cloudflared` traffic (UDP/TCP port `7844`). The server auto-falls back to SSH tunnel providers. |
+| SSH fallback not working | Both providers (localhost.run + serveo.net) are tried automatically. If both fail, your ISP blocks SSH — use a full-tunnel VPN. |
+| Link doesn't work on another device | Cloudflare URLs are temporary and change on each restart. Send the new link again. |
 
 ### Project layout
 

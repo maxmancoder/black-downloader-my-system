@@ -1,6 +1,6 @@
 @echo off
 REM ===========================================================================
-REM  Black Downloader My System - Windows launcher
+REM  Black Server My System - Windows launcher
 REM
 REM  Double-click this file to:
 REM    1. Check if all requirements are installed
@@ -14,10 +14,10 @@ REM ===========================================================================
 
 setlocal EnableExtensions
 cd /d "%~dp0"
-title Black Downloader My System
+title Black Server My System
 
 echo ========================================
-echo     BLACK DOWNLOADER MY SYSTEM
+echo     BLACK SERVER MY SYSTEM
 echo ========================================
 echo.
 
