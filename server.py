@@ -35,6 +35,7 @@ import argparse
 import functools
 import html
 import io
+import json
 import logging
 import os
 import re
@@ -48,6 +49,7 @@ import time
 import urllib.parse
 import urllib.request
 import webbrowser
+import zipfile
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
@@ -722,6 +724,113 @@ def _file_icon(ext: str) -> str:
     return _FILE_ICONS.get(ext, "\U0001F4C4")
 
 
+_FILE_BADGES: dict[str, tuple[str, str]] = {
+    # ext: (css class, inner label)
+    ".html": ("html", "&lt;/&gt;"),
+    ".htm": ("html", "&lt;/&gt;"),
+    ".css": ("css", "#"),
+    ".js": ("js", "JS"),
+    ".ts": ("ts", "TS"),
+    ".json": ("json", "{}"),
+    ".md": ("md", "MD"),
+    ".txt": ("txt", "TXT"),
+    ".png": ("img", "IMG"),
+    ".jpg": ("img", "IMG"),
+    ".jpeg": ("img", "IMG"),
+    ".gif": ("img", "IMG"),
+    ".webp": ("img", "IMG"),
+    ".svg": ("img", "SVG"),
+    ".ico": ("ico", "&#9733;"),
+    ".pdf": ("pdf", "PDF"),
+    ".zip": ("zip", "ZIP"),
+    ".rar": ("zip", "ZIP"),
+    ".7z": ("zip", "ZIP"),
+    ".mp4": ("vid", "MP4"),
+    ".mkv": ("vid", "MKV"),
+    ".mp3": ("aud", "MP3"),
+    ".py": ("py", "PY"),
+    ".exe": ("exe", "EXE"),
+}
+
+
+def _file_badge(ext: str) -> str:
+    """Colored rounded badge matching the file-manager UI."""
+    cls, label = _FILE_BADGES.get(ext, ("file", "FILE"))
+    return f'<span class="badge {cls}">{label}</span>'
+
+
+def _fmt_mtime(ts: float) -> str:
+    """Human-friendly modified time like ``Today, 05:30 PM`` / ``May 1, 2023``."""
+    dt = time.localtime(ts)
+    now = time.localtime()
+    if dt.tm_year == now.tm_year and dt.tm_yday == now.tm_yday:
+        return "Today, " + time.strftime("%I:%M %p", dt).lstrip("0")
+    if dt.tm_year == now.tm_year and dt.tm_yday == now.tm_yday - 1:
+        return "Yesterday, " + time.strftime("%I:%M %p", dt).lstrip("0")
+    return time.strftime("%b %d, %Y", dt)
+
+
+def _perm_string(path: Path) -> str:
+    """Unix-style permission string, e.g. ``drwxr-xr-x`` / ``rw-r--r--``."""
+    try:
+        st = path.stat()
+    except OSError:
+        return "rwxr-xr-x" if path.is_dir() else "rw-r--r--"
+    prefix = "d" if path.is_dir() else "-"
+    perms = ""
+    for shift in (6, 3, 0):
+        triple = (st.st_mode >> shift) & 0o7
+        perms += "r" if triple & 4 else "-"
+        perms += "w" if triple & 2 else "-"
+        perms += "x" if triple & 1 else "-"
+    return prefix + perms
+
+
+def _sidebar_tree(current: Path) -> str:
+    """Build the nested folder tree for the left sidebar."""
+    root = DOWNLOADS_DIR.resolve()
+
+    def walk(directory: Path) -> str:
+        try:
+            subdirs = sorted(
+                (
+                    p for p in directory.iterdir()
+                    if p.is_dir() and not p.name.startswith(".")
+                ),
+                key=lambda p: p.name.lower(),
+            )
+        except OSError:
+            return ""
+        parts = []
+        for sd in subdirs:
+            href = "/" + sd.relative_to(root).as_posix() + "/"
+            is_self = sd.resolve() == current.resolve()
+            under = str(current.resolve()).startswith(
+                str(sd.resolve()) + os.sep
+            ) or is_self
+            cls = " active" if is_self else ""
+            open_cls = " open" if under else ""
+            children = walk(sd)
+            parts.append(
+                f'<div class="tnode{open_cls}">'
+                f'<a class="tlink{cls}" href="{html.escape(href)}">'
+                f'<span class="tfolder"></span>'
+                f'<span class="tname">{html.escape(sd.name)}</span></a>'
+                f"{children}</div>"
+            )
+        return f'<div class="tkids">{"".join(parts)}</div>' if parts else ""
+
+    root_active = " active" if current.resolve() == root else ""
+    children = walk(root)
+    return (
+        '<div class="tnode open">'
+        f'<a class="tlink{root_active}" href="/">'
+        '<span class="tfolder root"></span>'
+        '<span class="tname">/</span></a>'
+        f"{children}</div>"
+    )
+
+
 # ---------------------------------------------------------------------------
 # File server
 # ---------------------------------------------------------------------------
@@ -780,18 +889,60 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND, "File not found")
             return None
 
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+
         if path.is_dir():
             # Redirect directory requests without a trailing slash so relative
             # links inside the listing work correctly.
-            if not self.path.endswith("/"):
+            if not self.path.rstrip("?").endswith("/"):
                 self.send_response(HTTPStatus.MOVED_PERMANENTLY)
-                self.send_header("Location", self.path + "/")
+                self.send_header("Location", self.path.split("?")[0] + "/")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return None
+            if query.get("zip"):
+                return self._send_zip(path)
             return self.list_directory(str(path))
 
+        if query.get("zip"):
+            return self._send_zip(path)
         return self._send_file(path)
+
+    def _send_zip(self, path: Path):
+        """Stream *path* (file or folder) as a ZIP archive."""
+        try:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                if path.is_dir():
+                    for root, _dirs, files in os.walk(path):
+                        for name in files:
+                            full = Path(root) / name
+                            if self._is_hidden(full):
+                                continue
+                            zf.write(full, full.relative_to(path))
+                    zip_name = (path.name or "downloads") + ".zip"
+                else:
+                    zf.write(path, path.name)
+                    zip_name = path.stem + ".zip"
+            data = buf.getvalue()
+        except OSError:
+            self.send_error(HTTPStatus.NOT_FOUND, "Cannot create ZIP")
+            return None
+
+        safe_ascii = "".join(
+            ch if 32 <= ord(ch) < 127 and ch not in '"\\' else "_"
+            for ch in zip_name
+        )
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header(
+            "Content-Disposition",
+            f'attachment; filename="{safe_ascii}"; '
+            f"filename*=UTF-8''{urllib.parse.quote(zip_name)}",
+        )
+        self.end_headers()
+        return io.BytesIO(data)
 
     def _send_file(self, path: Path):
         try:
@@ -914,433 +1065,884 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
         if display_path == "/.":
             display_path = "/"
 
+        tree_html = _sidebar_tree(current)
+        has_parent = current != root
+
         rows = []
-        if current != root:
+        first_file_json = "null"
+        file_count = 0
+
+        if has_parent:
             rows.append(
-                '<a class="card dir" href="../">'
-                '<div class="card-icon">&#8617;</div>'
-                '<div class="card-body">'
-                '<div class="card-name">.. (parent)</div>'
-                '<div class="card-meta">Back to parent folder</div>'
-                "</div></a>"
+                '<div class="frow dir" data-href="../" onclick="goParent()" '
+                'onmouseenter="hoverRow(this)" onmouseleave="unhoverRow(this)">'
+                '<div class="fcell fname">'
+                '<span class="badge folder">&#8617;</span>'
+                '<span class="ftext"><span class="flabel">..</span>'
+                '<span class="fsub">Parent folder</span></span></div>'
+                '<div class="fcell fsize">&mdash;</div>'
+                '<div class="fcell fmtime">&mdash;</div>'
+                '<div class="fcell fdot"><span class="dots">&#8943;</span></div>'
+                "</div>"
             )
 
         for name in entries:
             full = current / name
             link = urllib.parse.quote(name, safe="")
             label = html.escape(name)
+            try:
+                st = full.stat()
+                mtime = st.st_mtime
+                size_b = st.st_size
+            except OSError:
+                mtime = 0.0
+                size_b = 0
+
             if full.is_dir():
+                href = link + "/"
                 rows.append(
-                    f'<a class="card dir" href="{link}/">'
-                    f'<div class="card-icon">&#128193;</div>'
-                    f'<div class="card-body">'
-                    f'<div class="card-name">{label}</div>'
-                    f'<div class="card-meta">Folder</div>'
-                    "</div></a>"
+                    f'<div class="frow dir" data-href="{href}" '
+                    f'onclick="goDir(\'{href}\')" '
+                    f'onmouseenter="hoverRow(this)" onmouseleave="unhoverRow(this)">'
+                    f'<div class="fcell fname">'
+                    f'<span class="badge folder">&#128193;</span>'
+                    f'<span class="ftext"><span class="flabel">{label}</span>'
+                    f'<span class="fsub">Folder</span></span></div>'
+                    f'<div class="fcell fsize">&mdash;</div>'
+                    f'<div class="fcell fmtime">{_fmt_mtime(mtime)}</div>'
+                    f'<div class="fcell fdot"><span class="dots">&#8943;</span></div>'
+                    f"</div>"
                 )
             else:
-                try:
-                    size = human_size(full.stat().st_size)
-                except OSError:
-                    size = "?"
+                file_count += 1
                 ext = full.suffix.lower()
-                icon = _file_icon(ext)
-                type_label = ext.lstrip(".").upper() + " file" if ext else "File"
+                badge = _file_badge(ext)
+                size_str = human_size(size_b)
+                type_label = (ext.lstrip(".") + " file") if ext else "file"
+                perms = _perm_string(full)
+                rel_path = (display_path.rstrip("/") + "/" + name) if display_path != "/" else "/" + name
+                meta = json.dumps({
+                    "name": name,
+                    "href": link,
+                    "size": size_str,
+                    "sizeB": size_b,
+                    "type": type_label,
+                    "mtime": _fmt_mtime(mtime),
+                    "perm": perms,
+                    "path": rel_path,
+                    "ext": ext.lstrip(".") or "file",
+                })
+                if first_file_json == "null":
+                    first_file_json = meta
                 rows.append(
-                    f'<a class="card file" href="{link}" download>'
-                    f'<div class="card-icon">{icon}</div>'
-                    f'<div class="card-body">'
-                    f'<div class="card-name">{label}</div>'
-                    f'<div class="card-meta">{type_label} &middot; {size}</div>'
-                    "</div>"
-                    f'<div class="card-dl"><span>&#8595;</span></div>'
-                    "</a>"
+                    f'<div class="frow file" data-meta=\'{meta}\' '
+                    f'onclick="selectFile(this)" '
+                    f'onmouseenter="hoverRow(this)" onmouseleave="unhoverRow(this)">'
+                    f'<div class="fcell fname">{badge}'
+                    f'<span class="ftext"><span class="flabel">{label}</span>'
+                    f'<span class="fsub">{type_label} &middot; {size_str}</span></span></div>'
+                    f'<div class="fcell fsize">{size_str}</div>'
+                    f'<div class="fcell fmtime">{_fmt_mtime(mtime)}</div>'
+                    f'<div class="fcell fdot"><span class="dots">&#8943;</span></div>'
+                    f"</div>"
                 )
 
-        if rows:
-            body_rows = "\n".join(rows)
+        if not rows:
+            body_rows = (
+                '<div class="empty-state">'
+                "<div class=\"empty-icon\">&#128196;</div>"
+                "<div>No files in this folder</div>"
+                "</div>"
+            )
         else:
-            body_rows = '<div class="empty">&#128196; No files available.</div>'
+            body_rows = "\n".join(rows)
 
         page = f"""<!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>Black Server - {html.escape(display_path)}</title>
+<title>File Manager - Black Server</title>
 <style>
-  *,*::before,*::after {{ box-sizing:border-box; margin:0; padding:0; }}
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
 
-  :root, [data-theme="dark"] {{
-    --bg: #09090f;
-    --bg2: #111118;
-    --glass: rgba(255,255,255,.055);
-    --glass2: rgba(255,255,255,.09);
-    --glass3: rgba(255,255,255,.13);
-    --glass-hover: rgba(255,255,255,.12);
-    --border: rgba(255,255,255,.08);
-    --border-hover: rgba(255,255,255,.20);
-    --text: #f5f5f7;
-    --text2: #8e8e93;
-    --accent: #0a84ff;
-    --accent2: #5e5ce6;
-    --green: #30d158;
-    --orange: #ff9f0a;
-    --pink: #ff375f;
-    --shadow: 0 4px 24px rgba(0,0,0,.4);
-    --shadow-hover: 0 8px 32px rgba(10,132,255,.3);
-    --radius: 18px;
-    --blur: 28px;
+  :root {{
+    --bg: #070b14;
+    --bg2: #0b1120;
+    --panel: #0e1628;
+    --panel2: #111c33;
+    --panel3: #152240;
+    --border: #1c2d4f;
+    --border2: #243b66;
+    --text: #e8eefc;
+    --text2: #8ba0c5;
+    --text3: #5a719e;
+    --blue: #3b82f6;
+    --blue2: #2563eb;
+    --green: #22c55e;
+    --purple: #8b5cf6;
+    --pink: #ec4899;
+    --teal: #14b8a6;
+    --orange: #f59e0b;
+    --sel: rgba(59,130,246,.14);
+    --sel-border: rgba(59,130,246,.55);
+    --hover: rgba(59,130,246,.07);
+    --radius: 14px;
+    --shadow: 0 8px 32px rgba(0,0,0,.45);
   }}
 
-  [data-theme="light"] {{
-    --bg: #f2f2f7;
-    --bg2: #ffffff;
-    --glass: rgba(255,255,255,.70);
-    --glass2: rgba(255,255,255,.85);
-    --glass3: rgba(255,255,255,.92);
-    --glass-hover: rgba(255,255,255,.95);
-    --border: rgba(0,0,0,.07);
-    --border-hover: rgba(0,0,0,.16);
-    --text: #1c1c1e;
-    --text2: #6e6e73;
-    --accent: #007aff;
-    --accent2: #5856d6;
-    --green: #28a745;
-    --orange: #ff9500;
-    --pink: #ff2d55;
-    --shadow: 0 2px 16px rgba(0,0,0,.08);
-    --shadow-hover: 0 8px 28px rgba(0,122,255,.18);
-    --radius: 18px;
-    --blur: 28px;
-  }}
-
-  html {{ font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
-         "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  html {{ font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
          -webkit-font-smoothing: antialiased; }}
 
   body {{
     background: var(--bg);
     color: var(--text);
     min-height: 100vh;
-    transition: background .4s, color .4s;
+    padding: 18px;
   }}
 
-  body::before {{
-    content: "";
-    position: fixed; inset: 0;
-    background:
-      radial-gradient(ellipse 70% 40% at 15% 0%, rgba(10,132,255,.18), transparent),
-      radial-gradient(ellipse 50% 35% at 85% 100%, rgba(94,92,230,.14), transparent),
-      radial-gradient(ellipse 40% 30% at 50% 50%, rgba(255,55,95,.06), transparent);
-    pointer-events: none; z-index: 0;
+  /* ===== TOP BAR ===== */
+  .topbar {{
+    display: flex; align-items: center; gap: 14px;
+    margin-bottom: 16px;
   }}
-  [data-theme="light"] body::before {{
-    background:
-      radial-gradient(ellipse 70% 40% at 15% 0%, rgba(0,122,255,.10), transparent),
-      radial-gradient(ellipse 50% 35% at 85% 100%, rgba(88,86,214,.08), transparent);
+  .search {{
+    flex: 1; max-width: 520px; position: relative;
   }}
-
-  /* ===== FILE MANAGER SHELL ===== */
-  .fm {{
-    position: relative; z-index: 1;
-    max-width: 860px; margin: 2rem auto;
-    background: var(--glass);
-    border: 1px solid var(--border);
-    border-radius: 24px;
-    backdrop-filter: blur(var(--blur));
-    -webkit-backdrop-filter: blur(var(--blur));
-    box-shadow: var(--shadow);
-    overflow: hidden;
-    animation: shellIn .5s cubic-bezier(.16,1,.3,1) both;
-  }}
-
-  /* ---- toolbar ---- */
-  .toolbar {{
-    display: flex; align-items: center; gap: .75rem;
-    padding: .85rem 1.1rem;
-    background: var(--glass2);
-    border-bottom: 1px solid var(--border);
-    backdrop-filter: blur(var(--blur));
-    -webkit-backdrop-filter: blur(var(--blur));
-  }}
-  .traffic {{
-    display: flex; gap: 7px; flex-shrink: 0;
-  }}
-  .traffic span {{
-    width: 13px; height: 13px; border-radius: 50%;
-    display: inline-block;
-  }}
-  .traffic .r {{ background: #ff5f57; }}
-  .traffic .y {{ background: #febc2e; }}
-  .traffic .g {{ background: #28c840; }}
-  .toolbar-title {{
-    font-weight: 600; font-size: .95rem; letter-spacing: -.01em;
-    flex: 1; text-align: center;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }}
-  .toolbar-actions {{ display: flex; gap: .5rem; flex-shrink: 0; }}
-
-  .btn-icon {{
-    width: 34px; height: 34px; border-radius: 10px;
-    border: 1px solid var(--border);
-    background: var(--glass);
-    color: var(--text); font-size: .95rem; cursor: pointer;
-    display: flex; align-items: center; justify-content: center;
-    transition: all .25s cubic-bezier(.4,0,.2,1);
-  }}
-  .btn-icon:hover {{
-    background: var(--glass-hover);
-    border-color: var(--border-hover);
-    transform: scale(1.06);
-  }}
-  .btn-icon:active {{ transform: scale(.94); }}
-
-  /* ---- breadcrumb path ---- */
-  .pathbar {{
-    padding: .55rem 1.2rem;
-    background: var(--glass);
-    border-bottom: 1px solid var(--border);
-    font-size: .78rem; color: var(--text2);
-    font-weight: 500; word-break: break-all;
-    display: flex; align-items: center; gap: .4rem;
-  }}
-  .pathbar .dot {{
-    width: 6px; height: 6px; border-radius: 50%;
-    background: var(--accent); flex-shrink: 0;
-  }}
-
-  /* ---- content area ---- */
-  .content {{
-    padding: 1.1rem;
-    min-height: 300px;
-  }}
-
-  /* ===== FILE CARDS GRID ===== */
-  .grid {{
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-    gap: .8rem;
-  }}
-
-  .card {{
-    display: flex; flex-direction: column;
-    align-items: center; text-align: center;
-    padding: 1.2rem .8rem 1rem;
-    background: var(--glass2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
-    text-decoration: none; color: var(--text);
-    transition: all .3s cubic-bezier(.16,1,.3,1);
-    position: relative; overflow: hidden;
-    cursor: pointer;
-    animation: cardIn .45s cubic-bezier(.16,1,.3,1) both;
-  }}
-
-  /* subtle shine sweep on hover */
-  .card::before {{
-    content: "";
-    position: absolute; top: -50%; left: -50%;
-    width: 200%; height: 200%;
-    background: linear-gradient(
-      45deg, transparent 40%,
-      rgba(255,255,255,.06) 50%,
-      transparent 60%);
-    transform: translateX(-100%);
-    transition: transform .6s ease;
+  .search svg {{
+    position: absolute; left: 14px; top: 50%; transform: translateY(-50%);
+    width: 16px; height: 16px; stroke: var(--text3); fill: none;
     pointer-events: none;
   }}
-  .card:hover::before {{ transform: translateX(100%); }}
-
-  .card:hover {{
-    background: var(--glass-hover);
-    border-color: var(--border-hover);
-    transform: translateY(-6px) scale(1.03);
-    box-shadow: var(--shadow-hover);
+  .search input {{
+    width: 100%; padding: 12px 16px 12px 42px;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; color: var(--text); font-size: 14px;
+    outline: none; transition: border-color .2s, box-shadow .2s;
   }}
-  .card:active {{ transform: translateY(-2px) scale(1.01); }}
-
-  /* ---- card icon ---- */
-  .card-icon {{
-    font-size: 2.4rem; line-height: 1;
-    margin-bottom: .7rem;
-    width: 64px; height: 64px;
+  .search input::placeholder {{ color: var(--text3); }}
+  .search input:focus {{
+    border-color: var(--blue);
+    box-shadow: 0 0 0 3px rgba(59,130,246,.2);
+  }}
+  .top-right {{
+    margin-left: auto; display: flex; align-items: center; gap: 12px;
+  }}
+  .machine {{
+    display: flex; align-items: center; gap: 10px;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 8px 14px;
+  }}
+  .machine .mdot {{
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--green); box-shadow: 0 0 8px var(--green);
+    animation: pulse 2s infinite;
+  }}
+  @keyframes pulse {{
+    0%,100% {{ opacity: 1; }} 50% {{ opacity: .55; }}
+  }}
+  .machine .mtext {{ line-height: 1.15; }}
+  .machine .mtitle {{ font-size: 13px; font-weight: 600; }}
+  .machine .mstatus {{ font-size: 11px; color: var(--green); font-weight: 600; }}
+  .metrics {{
+    display: flex; gap: 8px;
+  }}
+  .metric {{
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 7px 11px; text-align: center;
+    min-width: 58px;
+  }}
+  .metric .mlabel {{
+    font-size: 9px; font-weight: 700; letter-spacing: .06em;
+    color: var(--text2); margin-bottom: 4px;
+  }}
+  .metric .mbar {{
+    height: 5px; border-radius: 3px; background: #1a2744; overflow: hidden;
+  }}
+  .metric .mbar i {{
+    display: block; height: 100%; border-radius: 3px;
+  }}
+  .metric.cpu .mbar i {{ width: 34%; background: var(--blue); }}
+  .metric.ram .mbar i {{ width: 56%; background: var(--green); }}
+  .metric.disk .mbar i {{ width: 42%; background: var(--purple); }}
+  .gear {{
+    width: 42px; height: 42px; border-radius: 12px;
+    background: var(--panel); border: 1px solid var(--border);
+    color: var(--text2); font-size: 18px; cursor: pointer;
     display: flex; align-items: center; justify-content: center;
-    background: var(--glass3);
+    transition: all .2s;
+  }}
+  .gear:hover {{ border-color: var(--blue); color: var(--text); }}
+
+  /* ===== MAIN CARD ===== */
+  .app {{
+    background: linear-gradient(180deg, var(--panel) 0%, var(--bg2) 100%);
     border: 1px solid var(--border);
-    border-radius: 18px;
-    transition: all .35s cubic-bezier(.16,1,.3,1);
+    border-radius: 20px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    animation: rise .45s cubic-bezier(.16,1,.3,1) both;
+  }}
+  @keyframes rise {{
+    from {{ opacity: 0; transform: translateY(16px); }}
+    to {{ opacity: 1; transform: translateY(0); }}
+  }}
+
+  .app-head {{
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 22px 26px 18px;
+    border-bottom: 1px solid var(--border);
+  }}
+  .app-head h1 {{
+    font-size: 26px; font-weight: 700; letter-spacing: -.02em;
+  }}
+  .app-head .sub {{
+    font-size: 13px; color: var(--text2); margin-top: 4px;
+  }}
+  .head-actions {{ display: flex; gap: 10px; }}
+  .btn {{
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 10px 18px; border-radius: 11px;
+    font-size: 13.5px; font-weight: 600; cursor: pointer;
+    border: 1px solid var(--border2); background: var(--panel2);
+    color: var(--text); transition: all .2s;
+  }}
+  .btn:hover {{ background: var(--panel3); border-color: var(--blue); }}
+  .btn.primary {{
+    background: linear-gradient(135deg, #4f8cff 0%, #3b5bfc 50%, #6d4df6 100%);
+    border: none; color: #fff;
+    box-shadow: 0 4px 18px rgba(79,140,255,.35);
+  }}
+  .btn.primary:hover {{
+    transform: translateY(-1px);
+    box-shadow: 0 6px 22px rgba(79,140,255,.5);
+  }}
+
+  /* ===== 3-COLUMN LAYOUT ===== */
+  .layout {{
+    display: grid;
+    grid-template-columns: 210px 1fr 300px;
+    min-height: 520px;
+  }}
+
+  /* ---- sidebar tree ---- */
+  .sidebar {{
+    background: rgba(0,0,0,.18);
+    border-right: 1px solid var(--border);
+    padding: 14px 10px;
+    overflow-y: auto;
+  }}
+  .tkids {{ padding-left: 16px; }}
+  .tnode > .tkids {{ display: none; }}
+  .tnode.open > .tkids {{ display: block; }}
+  .tlink {{
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 10px; border-radius: 8px;
+    color: var(--text2); text-decoration: none;
+    font-size: 13.5px; font-weight: 500;
+    transition: all .15s;
+    white-space: nowrap; overflow: hidden;
+  }}
+  .tlink:hover {{ background: var(--hover); color: var(--text); }}
+  .tlink.active {{
+    background: var(--sel); color: #7db4ff; font-weight: 600;
+  }}
+  .tfolder {{
+    width: 16px; height: 12px; flex-shrink: 0;
+    background: linear-gradient(180deg, #5b9dff, #3b82f6);
+    border-radius: 2px 3px 3px 3px;
     position: relative;
   }}
-  .card:hover .card-icon {{
-    background: var(--accent);
-    border-color: var(--accent);
-    transform: scale(1.12) rotate(-4deg);
-    box-shadow: 0 6px 20px rgba(10,132,255,.35);
+  .tfolder::before {{
+    content: ""; position: absolute; top: -3px; left: 0;
+    width: 7px; height: 4px; background: #5b9dff;
+    border-radius: 2px 2px 0 0;
   }}
-  .card.dir:hover .card-icon {{
-    background: var(--orange);
-    border-color: var(--orange);
-    box-shadow: 0 6px 20px rgba(255,159,10,.35);
+  .tfolder.root {{ background: linear-gradient(180deg, #94a3b8, #64748b); }}
+  .tfolder.root::before {{ background: #94a3b8; }}
+  .tname {{ overflow: hidden; text-overflow: ellipsis; }}
+
+  /* ---- center file list ---- */
+  .center {{
+    display: flex; flex-direction: column;
+    border-right: 1px solid var(--border);
+    min-width: 0;
   }}
-
-  /* ---- card text ---- */
-  .card-body {{ width: 100%; min-width: 0; }}
-
-  .card-name {{
-    font-weight: 600; font-size: .82rem; line-height: 1.3;
-    overflow: hidden; text-overflow: ellipsis;
-    display: -webkit-box; -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
-    margin-bottom: .3rem;
-    transition: color .2s;
-    word-break: break-word;
+  .list-tools {{
+    display: flex; align-items: center; justify-content: flex-end;
+    gap: 10px; padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
   }}
-  .card:hover .card-name {{ color: var(--accent); }}
-  .card.dir:hover .card-name {{ color: var(--orange); }}
+  .view-toggle {{
+    display: flex; background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 9px;
+    overflow: hidden;
+  }}
+  .view-toggle button {{
+    width: 36px; height: 32px; border: none; background: transparent;
+    color: var(--text3); cursor: pointer; font-size: 14px;
+    display: flex; align-items: center; justify-content: center;
+    transition: all .15s;
+  }}
+  .view-toggle button.on {{
+    background: var(--panel3); color: var(--blue);
+  }}
+  .sort-wrap {{ position: relative; }}
+  .sort-btn {{
+    display: flex; align-items: center; gap: 6px;
+    padding: 7px 14px; border-radius: 9px;
+    background: var(--panel2); border: 1px solid var(--border);
+    color: var(--text2); font-size: 13px; font-weight: 600;
+    cursor: pointer; transition: all .15s;
+  }}
+  .sort-btn:hover {{ border-color: var(--blue); color: var(--text); }}
+  .sort-menu {{
+    position: absolute; right: 0; top: calc(100% + 6px);
+    background: var(--panel2); border: 1px solid var(--border2);
+    border-radius: 10px; min-width: 150px; z-index: 50;
+    box-shadow: var(--shadow); display: none; overflow: hidden;
+  }}
+  .sort-menu.open {{ display: block; }}
+  .sort-menu button {{
+    display: block; width: 100%; text-align: left;
+    padding: 10px 14px; border: none; background: transparent;
+    color: var(--text2); font-size: 13px; cursor: pointer;
+    transition: background .12s;
+  }}
+  .sort-menu button:hover {{ background: var(--hover); color: var(--text); }}
+  .sort-menu button.on {{ color: var(--blue); font-weight: 600; }}
 
-  .card-meta {{
-    font-size: .68rem; color: var(--text2);
-    font-weight: 500; letter-spacing: .01em;
+  .thead {{
+    display: grid;
+    grid-template-columns: 1fr 90px 150px 40px;
+    gap: 8px; padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 11.5px; font-weight: 700; letter-spacing: .04em;
+    color: var(--text3); text-transform: uppercase;
+  }}
+  .tbody {{ flex: 1; overflow-y: auto; padding: 6px 8px; }}
+
+  .frow {{
+    display: grid;
+    grid-template-columns: 1fr 90px 150px 40px;
+    gap: 8px; align-items: center;
+    padding: 10px 10px; border-radius: 11px;
+    cursor: pointer; border: 1.5px solid transparent;
+    transition: background .15s, border-color .15s, transform .15s;
+    animation: rowIn .35s cubic-bezier(.16,1,.3,1) both;
+  }}
+  @keyframes rowIn {{
+    from {{ opacity: 0; transform: translateX(-8px); }}
+    to {{ opacity: 1; transform: translateX(0); }}
+  }}
+  .frow:hover {{ background: var(--hover); }}
+  .frow.selected {{
+    background: var(--sel);
+    border-color: var(--sel-border);
+    box-shadow: 0 0 0 1px var(--sel-border), 0 4px 16px rgba(59,130,246,.15);
+  }}
+  .frow .fname {{
+    display: flex; align-items: center; gap: 12px; min-width: 0;
+  }}
+  .ftext {{ min-width: 0; display: flex; flex-direction: column; gap: 2px; }}
+  .flabel {{
+    font-size: 14px; font-weight: 600;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }}
+  .fsub {{
+    font-size: 11.5px; color: var(--text3);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }}
+  .fsize, .fmtime {{
+    font-size: 12.5px; color: var(--text2);
+    font-variant-numeric: tabular-nums;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }}
+  .fdot {{ text-align: center; }}
+  .dots {{
+    color: var(--text3); font-size: 18px; letter-spacing: 1px;
+    opacity: 0; transition: opacity .15s;
+  }}
+  .frow:hover .dots {{ opacity: 1; }}
 
-  /* ---- download badge (appears on hover) ---- */
-  .card-dl {{
-    position: absolute; top: .55rem; right: .55rem;
-    width: 28px; height: 28px;
-    background: var(--green);
-    border-radius: 50%;
+  /* file type badges */
+  .badge {{
+    width: 38px; height: 38px; flex-shrink: 0;
+    border-radius: 10px;
     display: flex; align-items: center; justify-content: center;
-    opacity: 0; transform: scale(.5);
-    transition: all .3s cubic-bezier(.16,1,.3,1);
-    box-shadow: 0 2px 8px rgba(48,209,88,.4);
+    font-size: 11px; font-weight: 800; letter-spacing: -.02em;
+    color: #fff;
   }}
-  .card-dl span {{
-    color: #fff; font-size: .85rem; font-weight: 700;
-    line-height: 1;
-  }}
-  .card:hover .card-dl {{
-    opacity: 1; transform: scale(1);
-  }}
-  .card.dir .card-dl {{ display: none; }}
-
-  /* ---- empty state ---- */
-  .empty {{
-    text-align: center; color: var(--text2);
-    padding: 4rem 1rem; font-size: 1rem;
-    font-weight: 500;
-    background: var(--glass2);
-    border: 2px dashed var(--border);
-    border-radius: var(--radius);
-    grid-column: 1 / -1;
-  }}
-
-  /* ---- status bar ---- */
-  .statusbar {{
-    display: flex; align-items: center; justify-content: space-between;
-    padding: .55rem 1.1rem;
-    background: var(--glass2);
-    border-top: 1px solid var(--border);
-    font-size: .7rem; color: var(--text2); font-weight: 500;
-  }}
-  .statusbar .badge {{
-    background: var(--accent);
-    color: #fff; padding: .15rem .5rem;
-    border-radius: 6px; font-size: .65rem;
-    font-weight: 700;
+  .badge.html {{ background: linear-gradient(135deg,#f97316,#ea580c); font-size: 12px; }}
+  .badge.css  {{ background: linear-gradient(135deg,#38bdf8,#0284c7); }}
+  .badge.js   {{ background: linear-gradient(135deg,#facc15,#eab308); color: #1a1a1a; }}
+  .badge.ts   {{ background: linear-gradient(135deg,#60a5fa,#2563eb); }}
+  .badge.json {{ background: linear-gradient(135deg,#4ade80,#16a34a); font-size: 13px; }}
+  .badge.md   {{ background: linear-gradient(135deg,#60a5fa,#3b82f6); }}
+  .badge.txt  {{ background: linear-gradient(135deg,#f472b6,#db2777); font-size: 9px; }}
+  .badge.img  {{ background: linear-gradient(135deg,#a78bfa,#7c3aed); font-size: 9px; }}
+  .badge.svg  {{ background: linear-gradient(135deg,#fb923c,#f97316); font-size: 9px; }}
+  .badge.ico  {{ background: linear-gradient(135deg,#fde047,#eab308); color: #854d0e; font-size: 16px; }}
+  .badge.pdf  {{ background: linear-gradient(135deg,#f87171,#dc2626); }}
+  .badge.zip  {{ background: linear-gradient(135deg,#c084fc,#a855f7); }}
+  .badge.vid  {{ background: linear-gradient(135deg,#f472b6,#ec4899); font-size: 9px; }}
+  .badge.aud  {{ background: linear-gradient(135deg,#2dd4bf,#0d9488); font-size: 9px; }}
+  .badge.py   {{ background: linear-gradient(135deg,#fbbf24,#f59e0b); }}
+  .badge.exe  {{ background: linear-gradient(135deg,#94a3b8,#64748b); font-size: 9px; }}
+  .badge.file {{ background: linear-gradient(135deg,#64748b,#475569); font-size: 9px; }}
+  .badge.folder {{
+    background: linear-gradient(135deg,#60a5fa,#3b82f6);
+    font-size: 16px;
   }}
 
-  /* ===== ANIMATIONS ===== */
-  @keyframes shellIn {{
-    from {{ opacity: 0; transform: translateY(20px) scale(.98); }}
-    to {{ opacity: 1; transform: translateY(0) scale(1); }}
+  .empty-state {{
+    text-align: center; padding: 60px 20px; color: var(--text3);
+    font-size: 14px;
   }}
-  @keyframes cardIn {{
-    from {{ opacity: 0; transform: translateY(14px) scale(.96); }}
-    to {{ opacity: 1; transform: translateY(0) scale(1); }}
-  }}
-  .card:nth-child(1)  {{ animation-delay: .03s; }}
-  .card:nth-child(2)  {{ animation-delay: .06s; }}
-  .card:nth-child(3)  {{ animation-delay: .09s; }}
-  .card:nth-child(4)  {{ animation-delay: .12s; }}
-  .card:nth-child(5)  {{ animation-delay: .15s; }}
-  .card:nth-child(6)  {{ animation-delay: .18s; }}
-  .card:nth-child(7)  {{ animation-delay: .21s; }}
-  .card:nth-child(8)  {{ animation-delay: .24s; }}
-  .card:nth-child(9)  {{ animation-delay: .27s; }}
-  .card:nth-child(10) {{ animation-delay: .30s; }}
-  .card:nth-child(11) {{ animation-delay: .33s; }}
-  .card:nth-child(12) {{ animation-delay: .36s; }}
+  .empty-icon {{ font-size: 42px; margin-bottom: 12px; opacity: .5; }}
 
-  /* ===== RESPONSIVE ===== */
-  @media (max-width: 560px) {{
-    .fm {{ margin: .75rem; border-radius: 20px; }}
-    .grid {{ grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: .6rem; }}
-    .content {{ padding: .8rem; }}
-    .card {{ padding: 1rem .6rem .8rem; border-radius: 14px; }}
-    .card-icon {{ width: 52px; height: 52px; font-size: 1.9rem; border-radius: 14px; }}
-    .card-name {{ font-size: .76rem; }}
-    .traffic {{ display: none; }}
-    .toolbar-title {{ text-align: left; }}
+  /* ---- right details panel ---- */
+  .details {{
+    background: rgba(0,0,0,.22);
+    padding: 22px 18px;
+    overflow-y: auto;
+    display: flex; flex-direction: column; gap: 22px;
+  }}
+  .detail-top {{
+    display: flex; flex-direction: column; align-items: center;
+    text-align: center; gap: 6px;
+  }}
+  .detail-icon {{
+    width: 72px; height: 72px; border-radius: 18px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 26px; font-weight: 800; color: #fff;
+    margin-bottom: 6px;
+    box-shadow: 0 8px 24px rgba(0,0,0,.35);
+  }}
+  .detail-icon.html {{ background: linear-gradient(135deg,#f97316,#ea580c); }}
+  .detail-icon.css  {{ background: linear-gradient(135deg,#38bdf8,#0284c7); }}
+  .detail-icon.js   {{ background: linear-gradient(135deg,#facc15,#eab308); color:#1a1a1a; }}
+  .detail-icon.file {{ background: linear-gradient(135deg,#64748b,#475569); }}
+  .detail-icon.folder {{ background: linear-gradient(135deg,#60a5fa,#3b82f6); }}
+  .detail-name {{
+    font-size: 17px; font-weight: 700; word-break: break-all;
+  }}
+  .detail-path {{
+    font-size: 12px; color: var(--text3); word-break: break-all;
+  }}
+  .meta-table {{
+    display: flex; flex-direction: column; gap: 0;
+    background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 12px; overflow: hidden;
+  }}
+  .meta-row {{
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 11px 14px; font-size: 13px;
+    border-bottom: 1px solid var(--border);
+  }}
+  .meta-row:last-child {{ border-bottom: none; }}
+  .meta-row .mk {{ color: var(--text3); font-weight: 500; }}
+  .meta-row .mv {{ color: var(--text); font-weight: 600; text-align: right; }}
+
+  .dl-title {{
+    font-size: 16px; font-weight: 700; margin-bottom: 4px;
+  }}
+  .dl-center {{ display: flex; flex-direction: column; gap: 12px; }}
+  .dl-btn {{
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 14px; border-radius: 14px;
+    text-decoration: none; color: #fff; cursor: pointer;
+    border: none; width: 100%; text-align: left;
+    font-family: inherit;
+    transition: transform .2s, box-shadow .2s, filter .2s;
+    position: relative; overflow: hidden;
+  }}
+  .dl-btn::after {{
+    content: ""; position: absolute; inset: 0;
+    background: linear-gradient(135deg, rgba(255,255,255,.18), transparent 50%);
+    opacity: 0; transition: opacity .2s;
+  }}
+  .dl-btn:hover {{ transform: translateY(-2px); filter: brightness(1.08); }}
+  .dl-btn:hover::after {{ opacity: 1; }}
+  .dl-btn:active {{ transform: translateY(0); }}
+  .dl-btn.blue {{
+    background: linear-gradient(135deg, #60a5fa 0%, #3b82f6 55%, #2563eb 100%);
+    box-shadow: 0 6px 20px rgba(59,130,246,.4);
+  }}
+  .dl-btn.teal {{
+    background: linear-gradient(135deg, #2dd4bf 0%, #14b8a6 55%, #0d9488 100%);
+    box-shadow: 0 6px 20px rgba(20,184,166,.4);
+  }}
+  .dl-btn.purple {{
+    background: linear-gradient(135deg, #a78bfa 0%, #8b5cf6 55%, #7c3aed 100%);
+    box-shadow: 0 6px 20px rgba(139,92,246,.4);
+  }}
+  .dl-btn.pink {{
+    background: linear-gradient(135deg, #f472b6 0%, #ec4899 55%, #db2777 100%);
+    box-shadow: 0 6px 20px rgba(236,72,153,.4);
+  }}
+  .dl-ico {{
+    width: 42px; height: 42px; border-radius: 11px; flex-shrink: 0;
+    background: rgba(255,255,255,.2);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px;
+  }}
+  .dl-txt {{ flex: 1; min-width: 0; }}
+  .dl-txt .t {{ font-size: 14px; font-weight: 700; }}
+  .dl-txt .s {{
+    font-size: 11.5px; opacity: .88; margin-top: 2px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }}
+  .dl-arrow {{
+    width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0;
+    background: rgba(255,255,255,.22);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; font-weight: 700;
+  }}
+
+  /* ---- grid view ---- */
+  .tbody.grid-view {{
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 10px; padding: 12px;
+  }}
+  .tbody.grid-view .frow {{
+    display: flex; flex-direction: column; text-align: center;
+    gap: 8px; padding: 16px 8px 12px;
+    grid-template-columns: none;
+  }}
+  .tbody.grid-view .fcell.fsize,
+  .tbody.grid-view .fcell.fmtime,
+  .tbody.grid-view .fcell.fdot {{ display: none; }}
+  .tbody.grid-view .fname {{
+    flex-direction: column; gap: 8px;
+  }}
+  .tbody.grid-view .badge {{ width: 52px; height: 52px; border-radius: 14px; font-size: 14px; }}
+  .tbody.grid-view .ftext {{ align-items: center; }}
+  .tbody.grid-view .fsub {{ display: none; }}
+
+  /* ---- toast ---- */
+  .toast {{
+    position: fixed; bottom: 28px; left: 50%;
+    transform: translateX(-50%) translateY(80px);
+    background: var(--panel3); border: 1px solid var(--border2);
+    color: var(--text); padding: 12px 22px; border-radius: 12px;
+    font-size: 13.5px; font-weight: 600; z-index: 999;
+    box-shadow: var(--shadow); opacity: 0;
+    transition: all .35s cubic-bezier(.16,1,.3,1);
+    pointer-events: none;
+  }}
+  .toast.show {{ opacity: 1; transform: translateX(-50%) translateY(0); }}
+
+  /* ---- responsive ---- */
+  @media (max-width: 980px) {{
+    .layout {{ grid-template-columns: 1fr; }}
+    .sidebar {{ display: none; }}
+    .center {{ border-right: none; }}
+    .details {{ border-top: 1px solid var(--border); }}
+    .metrics {{ display: none; }}
+    .thead, .frow {{ grid-template-columns: 1fr 80px 40px; }}
+    .thead .h-mtime, .frow .fmtime {{ display: none; }}
+  }}
+  @media (max-width: 600px) {{
+    body {{ padding: 8px; }}
+    .app-head {{ flex-direction: column; gap: 14px; align-items: flex-start; }}
+    .top-right .machine .mtext {{ display: none; }}
+    .thead, .frow {{ grid-template-columns: 1fr 40px; }}
+    .thead .h-size, .frow .fsize {{ display: none; }}
   }}
 </style>
 </head>
 <body>
-<div class="fm">
-  <!-- toolbar (macOS Finder style) -->
-  <div class="toolbar">
-    <div class="traffic">
-      <span class="r"></span><span class="y"></span><span class="g"></span>
-    </div>
-    <div class="toolbar-title">&#9679; Black Server</div>
-    <div class="toolbar-actions">
-      <button class="btn-icon" id="themeBtn" title="Toggle theme"
-              onclick="toggleTheme()">&#127769;</button>
-    </div>
-  </div>
 
-  <!-- breadcrumb path -->
-  <div class="pathbar">
-    <span class="dot"></span>
-    {html.escape(display_path)}
+<!-- top bar -->
+<div class="topbar">
+  <div class="search">
+    <svg viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round">
+      <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>
+    </svg>
+    <input type="text" id="searchInput" placeholder="Search files, folders, or commands..."
+           oninput="filterRows()">
   </div>
-
-  <!-- file grid -->
-  <div class="content">
-    <div class="grid">
-{body_rows}
+  <div class="top-right">
+    <div class="machine">
+      <span class="mdot"></span>
+      <div class="mtext">
+        <div class="mtitle">Local Machine</div>
+        <div class="mstatus">Online</div>
+      </div>
     </div>
-  </div>
-
-  <!-- status bar -->
-  <div class="statusbar">
-    <span>{len(entries)} item{'s' if len(entries) != 1 else ''}</span>
-    <span class="badge">read-only</span>
+    <div class="metrics">
+      <div class="metric cpu"><div class="mlabel">CPU</div><div class="mbar"><i></i></div></div>
+      <div class="metric ram"><div class="mlabel">RAM</div><div class="mbar"><i></i></div></div>
+      <div class="metric disk"><div class="mlabel">DISK</div><div class="mbar"><i></i></div></div>
+    </div>
+    <button class="gear" title="Settings" onclick="toast('Settings are not available yet')">&#9881;</button>
   </div>
 </div>
 
+<!-- main app -->
+<div class="app">
+  <div class="app-head">
+    <div>
+      <h1>File Manager</h1>
+      <div class="sub">Browse and manage your server files</div>
+    </div>
+    <div class="head-actions">
+      <button class="btn" onclick="toast('New Folder requires write access')">
+        &#128193; New Folder
+      </button>
+      <button class="btn primary" onclick="toast('Upload requires write access')">
+        &#8682; Upload
+      </button>
+    </div>
+  </div>
+
+  <div class="layout">
+    <!-- sidebar -->
+    <aside class="sidebar">
+      {tree_html}
+    </aside>
+
+    <!-- center list -->
+    <section class="center">
+      <div class="list-tools">
+        <div class="view-toggle">
+          <button id="btnGrid" title="Grid view" onclick="setView('grid')">&#9638;</button>
+          <button id="btnList" class="on" title="List view" onclick="setView('list')">&#9776;</button>
+        </div>
+        <div class="sort-wrap">
+          <button class="sort-btn" onclick="toggleSort(event)">Sort &#9662;</button>
+          <div class="sort-menu" id="sortMenu">
+            <button data-k="name" class="on" onclick="sortRows('name',this)">Name</button>
+            <button data-k="size" onclick="sortRows('size',this)">Size</button>
+            <button data-k="date" onclick="sortRows('date',this)">Last Modified</button>
+          </div>
+        </div>
+      </div>
+      <div class="thead">
+        <div>Name</div>
+        <div class="h-size">Size</div>
+        <div class="h-mtime">Last Modified</div>
+        <div></div>
+      </div>
+      <div class="tbody" id="tbody">
+{body_rows}
+      </div>
+    </section>
+
+    <!-- right details -->
+    <aside class="details">
+      <div class="detail-top">
+        <div class="detail-icon file" id="dIcon">&#128196;</div>
+        <div class="detail-name" id="dName">No file selected</div>
+        <div class="detail-path" id="dPath">{html.escape(display_path)}</div>
+      </div>
+
+      <div class="meta-table">
+        <div class="meta-row"><span class="mk">File size</span><span class="mv" id="dSize">&mdash;</span></div>
+        <div class="meta-row"><span class="mk">File type</span><span class="mv" id="dType">&mdash;</span></div>
+        <div class="meta-row"><span class="mk">Modified</span><span class="mv" id="dMod">&mdash;</span></div>
+        <div class="meta-row"><span class="mk">Permissions</span><span class="mv" id="dPerm">&mdash;</span></div>
+      </div>
+
+      <div>
+        <div class="dl-title">Download Center</div>
+        <div class="dl-center" style="margin-top:12px">
+          <button class="dl-btn blue" id="btnDownload" onclick="actDownload()">
+            <span class="dl-ico">&#8681;</span>
+            <span class="dl-txt">
+              <span class="t">Download File</span>
+              <span class="s" id="dlSub1">Select a file</span>
+            </span>
+            <span class="dl-arrow">&#8250;</span>
+          </button>
+          <button class="dl-btn teal" id="btnZip" onclick="actZip()">
+            <span class="dl-ico">&#128230;</span>
+            <span class="dl-txt">
+              <span class="t">Download as ZIP</span>
+              <span class="s" id="dlSub2">Compress and download</span>
+            </span>
+            <span class="dl-arrow">&#8250;</span>
+          </button>
+          <button class="dl-btn purple" onclick="actShare()">
+            <span class="dl-ico">&#128279;</span>
+            <span class="dl-txt">
+              <span class="t">Create Share Link</span>
+              <span class="s">Generate temporary download URL</span>
+            </span>
+            <span class="dl-arrow">&#8250;</span>
+          </button>
+          <button class="dl-btn pink" onclick="actCopy()">
+            <span class="dl-ico">&#10697;</span>
+            <span class="dl-txt">
+              <span class="t">Copy Direct Link</span>
+              <span class="s">Copy file URL to clipboard</span>
+            </span>
+            <span class="dl-arrow">&#8250;</span>
+          </button>
+        </div>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
 <script>
-(function(){{
-  var t = localStorage.getItem('bs-theme');
-  if (t === 'light' || t === 'dark')
-    document.documentElement.setAttribute('data-theme', t);
-  updateIcon();
+var BASE = {json.dumps(display_path)};
+var SELECTED = {first_file_json};
+var TOTAL = {file_count};
+
+(function init() {{
+  if (SELECTED) applyMeta(SELECTED);
+  else document.getElementById("dName").textContent = "No file selected";
+  var rows = document.querySelectorAll(".frow.file");
+  if (rows.length) selectFile(rows[0]);
 }})();
-function toggleTheme(){{
-  var el = document.documentElement;
-  var cur = el.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
-  el.setAttribute('data-theme', cur);
-  localStorage.setItem('bs-theme', cur);
-  updateIcon();
+
+function applyMeta(m) {{
+  SELECTED = m;
+  var icon = document.getElementById("dIcon");
+  var ext = (m.ext || "file").toLowerCase();
+  var map = {{html:"</>", css:"#", js:"JS", json:"{{}}", md:"MD", txt:"TXT",
+              png:"IMG", jpg:"IMG", jpeg:"IMG", gif:"IMG", ico:"&#9733;",
+              pdf:"PDF", zip:"ZIP", py:"PY"}};
+  var cls = {{html:"html", css:"css", js:"js", css:"css"}};
+  var badgeCls = "file";
+  if (ext === "html" || ext === "htm") badgeCls = "html";
+  else if (ext === "css") badgeCls = "css";
+  else if (ext === "js") badgeCls = "js";
+  else if (ext === "json") badgeCls = "json";
+  else if (ext === "md") badgeCls = "md";
+  else if (ext === "zip" || ext === "rar" || ext === "7z") badgeCls = "zip";
+  else if (ext === "pdf") badgeCls = "pdf";
+  else if (ext === "png" || ext === "jpg" || ext === "jpeg" || ext === "gif") badgeCls = "html";
+  icon.className = "detail-icon " + badgeCls;
+  icon.innerHTML = map[ext] || "&#128196;";
+  document.getElementById("dName").textContent = m.name;
+  document.getElementById("dPath").textContent = m.path;
+  document.getElementById("dSize").textContent = m.size;
+  document.getElementById("dType").textContent = m.type;
+  document.getElementById("dMod").textContent = m.mtime;
+  document.getElementById("dPerm").textContent = m.perm;
+  document.getElementById("dlSub1").textContent = "Get " + m.name + " (" + m.size + ")";
+  document.getElementById("dlSub2").textContent = "Download " + m.name + " as ZIP";
 }}
-function updateIcon(){{
-  var t = document.documentElement.getAttribute('data-theme');
-  document.getElementById('themeBtn').innerHTML =
-    t === 'light' ? '&#127769;' : '&#127761;';
+
+function selectFile(row) {{
+  document.querySelectorAll(".frow.selected").forEach(function(r) {{
+    r.classList.remove("selected");
+  }});
+  row.classList.add("selected");
+  try {{ applyMeta(JSON.parse(row.getAttribute("data-meta"))); }}
+  catch (e) {{}}
+}}
+
+function goDir(href) {{ window.location.href = href; }}
+function goParent() {{ window.location.href = "../"; }}
+function hoverRow(r) {{ if (!r.classList.contains("selected")) r.style.background = "var(--hover)"; }}
+function unhoverRow(r) {{ if (!r.classList.contains("selected")) r.style.background = ""; }}
+
+function filterRows() {{
+  var q = document.getElementById("searchInput").value.toLowerCase();
+  document.querySelectorAll("#tbody .frow").forEach(function(r) {{
+    var t = r.textContent.toLowerCase();
+    r.style.display = t.indexOf(q) >= 0 ? "" : "none";
+  }});
+}}
+
+function setView(v) {{
+  var tb = document.getElementById("tbody");
+  var bg = document.getElementById("btnGrid");
+  var bl = document.getElementById("btnList");
+  if (v === "grid") {{ tb.classList.add("grid-view"); bg.classList.add("on"); bl.classList.remove("on"); }}
+  else {{ tb.classList.remove("grid-view"); bl.classList.add("on"); bg.classList.remove("on"); }}
+}}
+
+function toggleSort(e) {{
+  e.stopPropagation();
+  document.getElementById("sortMenu").classList.toggle("open");
+}}
+document.addEventListener("click", function() {{
+  document.getElementById("sortMenu").classList.remove("open");
+}});
+
+function sortRows(key, btn) {{
+  document.querySelectorAll(".sort-menu button").forEach(function(b) {{
+    b.classList.remove("on");
+  }});
+  btn.classList.add("on");
+  var tb = document.getElementById("tbody");
+  var rows = Array.prototype.slice.call(tb.querySelectorAll(".frow"));
+  rows.sort(function(a, b) {{
+    var ma = null, mb = null;
+    try {{ ma = JSON.parse(a.getAttribute("data-meta")); }} catch (e) {{}}
+    try {{ mb = JSON.parse(b.getAttribute("data-meta")); }} catch (e) {{}}
+    if (key === "name") {{
+      var na = (ma && ma.name) || a.textContent.trim();
+      var nb = (mb && mb.name) || b.textContent.trim();
+      return na.localeCompare(nb);
+    }}
+    if (key === "size") {{
+      var sa = ma ? ma.sizeB : -1;
+      var sb = mb ? mb.sizeB : -1;
+      return sb - sa;
+    }}
+    if (key === "date") {{
+      var da = ma ? ma.mtime : "";
+      var db = mb ? mb.mtime : "";
+      return da < db ? 1 : da > db ? -1 : 0;
+    }}
+    return 0;
+  }});
+  rows.forEach(function(r) {{ tb.appendChild(r); }});
+}}
+
+function currentHref() {{
+  if (!SELECTED) return null;
+  return SELECTED.href;
+}}
+
+function actDownload() {{
+  if (!SELECTED) {{ toast("Select a file first"); return; }}
+  window.location.href = SELECTED.href;
+}}
+function actZip() {{
+  if (!SELECTED) {{ toast("Select a file first"); return; }}
+  window.location.href = SELECTED.href + "?zip=1";
+}}
+function actShare() {{
+  if (!SELECTED) {{ toast("Select a file first"); return; }}
+  var url = location.origin + BASE.replace(/\\/$/, "") + "/" + SELECTED.href;
+  copyText(url, "Share link copied!");
+}}
+function actCopy() {{
+  if (!SELECTED) {{ toast("Select a file first"); return; }}
+  var url = location.origin + BASE.replace(/\\/$/, "") + "/" + SELECTED.href;
+  copyText(url, "Direct link copied!");
+}}
+function copyText(t, msg) {{
+  if (navigator.clipboard && navigator.clipboard.writeText) {{
+    navigator.clipboard.writeText(t).then(function() {{ toast(msg); }},
+      function() {{ fallbackCopy(t, msg); }});
+  }} else fallbackCopy(t, msg);
+}}
+function fallbackCopy(t, msg) {{
+  var ta = document.createElement("textarea");
+  ta.value = t; document.body.appendChild(ta);
+  ta.select(); try {{ document.execCommand("copy"); }} catch (e) {{}}
+  document.body.removeChild(ta); toast(msg);
+}}
+
+var toastTimer = null;
+function toast(msg) {{
+  var el = document.getElementById("toast");
+  el.textContent = msg;
+  el.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(function() {{ el.classList.remove("show"); }}, 2400);
 }}
 </script>
 </body>
