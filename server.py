@@ -686,6 +686,43 @@ def try_ssh_fallback(port: int, timeout: float = SSH_STARTUP_TIMEOUT,
 
 
 # ---------------------------------------------------------------------------
+# File icons (based on extension)
+# ---------------------------------------------------------------------------
+
+_FILE_ICONS: dict[str, str] = {
+    ".zip": "\U0001F4E6", ".rar": "\U0001F4E6", ".7z": "\U0001F4E6",
+    ".tar": "\U0001F4E6", ".gz": "\U0001F4E6",
+    ".pdf": "\U0001F4C4",
+    ".doc": "\U0001F4C3", ".docx": "\U0001F4C3",
+    ".xls": "\U0001F4CA", ".xlsx": "\U0001F4CA",
+    ".ppt": "\U0001F4AC", ".pptx": "\U0001F4AC",
+    ".txt": "\U0001F4DD", ".md": "\U0001F4DD",
+    ".jpg": "\U0001F5BC\uFE0F", ".jpeg": "\U0001F5BC\uFE0F",
+    ".png": "\U0001F5BC\uFE0F", ".gif": "\U0001F5BC\uFE0F",
+    ".webp": "\U0001F5BC\uFE0F", ".bmp": "\U0001F5BC\uFE0F",
+    ".svg": "\U0001F5BC\uFE0F", ".ico": "\U0001F5BC\uFE0F",
+    ".mp3": "\U0001F3B5", ".wav": "\U0001F3B5", ".flac": "\U0001F3B5",
+    ".aac": "\U0001F3B5", ".ogg": "\U0001F3B5", ".m4a": "\U0001F3B5",
+    ".mp4": "\U0001F3AC", ".mkv": "\U0001F3AC", ".avi": "\U0001F3AC",
+    ".mov": "\U0001F3AC", ".wmv": "\U0001F3AC", ".webm": "\U0001F3AC",
+    ".exe": "\u2699\uFE0F", ".msi": "\u2699\uFE0F",
+    ".py": "\U0001F40D", ".js": "\U0001F4DC", ".ts": "\U0001F4DC",
+    ".html": "\U0001F310", ".css": "\U0001F310",
+    ".json": "\U0001F4CB", ".xml": "\U0001F4CB", ".csv": "\U0001F4CB",
+    ".iso": "\U0001F4BF", ".img": "\U0001F4BF",
+    ".apk": "\U0001F4F1",
+    ".ttf": "\U0001F5A8\uFE0F", ".otf": "\U0001F5A8\uFE0F",
+    ".log": "\U0001F4DD", ".ini": "\u2699\uFE0F",
+    ".bak": "\U0001F4BE",
+}
+
+
+def _file_icon(ext: str) -> str:
+    """Return an emoji icon for a file extension."""
+    return _FILE_ICONS.get(ext, "\U0001F4C4")
+
+
+# ---------------------------------------------------------------------------
 # File server
 # ---------------------------------------------------------------------------
 
@@ -880,8 +917,11 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
         rows = []
         if current != root:
             rows.append(
-                '<tr><td><a class="name dir" href="../">&#8617; .. (parent)</a>'
-                "</td><td class=\"size\"></td></tr>"
+                '<a class="card dir" href="../">'
+                '<span class="icon">&#8617;</span>'
+                '<span class="name">.. (parent)</span>'
+                '<span class="size"></span>'
+                "</a>"
             )
 
         for name in entries:
@@ -890,63 +930,320 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             label = html.escape(name)
             if full.is_dir():
                 rows.append(
-                    f'<tr><td><a class="name dir" href="{link}/">{label}/</a></td>'
-                    '<td class="size">&mdash;</td></tr>'
+                    f'<a class="card dir" href="{link}/">'
+                    f'<span class="icon">&#128193;</span>'
+                    f'<span class="name">{label}</span>'
+                    '<span class="size">&mdash;</span>'
+                    "</a>"
                 )
             else:
                 try:
                     size = human_size(full.stat().st_size)
                 except OSError:
                     size = "?"
+                ext = full.suffix.lower()
+                icon = _file_icon(ext)
                 rows.append(
-                    f'<tr><td><a class="name" href="{link}">{label}</a></td>'
-                    f'<td class="size">{size}</td></tr>'
+                    f'<a class="card file" href="{link}" download>'
+                    f'<span class="icon">{icon}</span>'
+                    f'<span class="name">{label}</span>'
+                    f'<span class="size">{size}</span>'
+                    '<span class="dl">&#8595;</span>'
+                    "</a>"
                 )
 
         if rows:
             body_rows = "\n".join(rows)
         else:
-            body_rows = '<tr><td colspan="2" class="empty">No files available.</td></tr>'
+            body_rows = '<div class="empty">No files available.</div>'
 
         page = f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>Black Server - {html.escape(display_path)}</title>
 <style>
-  :root {{ color-scheme: dark; }}
-  body {{ font-family: "Segoe UI", system-ui, sans-serif; background:#0f1115;
-         color:#e6e6e6; margin:0; padding:2rem; }}
-  .wrap {{ max-width:820px; margin:0 auto; }}
-  h1 {{ font-size:1.4rem; margin:0 0 .25rem; }}
-  .path {{ color:#8b93a7; font-size:.85rem; margin-bottom:1.25rem;
-           word-break:break-all; }}
-  hr {{ border:0; border-top:1px solid #262b36; margin:0 0 .75rem; }}
-  table {{ width:100%; border-collapse:collapse; }}
-  td {{ padding:.55rem .4rem; border-bottom:1px solid #1c2029; }}
-  td.size {{ text-align:right; color:#8b93a7; white-space:nowrap;
-             font-variant-numeric:tabular-nums; }}
-  a.name {{ color:#7db4ff; text-decoration:none; }}
-  a.name:hover {{ text-decoration:underline; }}
-  a.dir {{ color:#ffd479; }}
-  .empty {{ color:#8b93a7; text-align:center; padding:1.5rem; }}
-  footer {{ margin-top:1.5rem; color:#5b6373; font-size:.75rem; }}
+  *,*::before,*::after {{ box-sizing:border-box; margin:0; padding:0; }}
+
+  :root, [data-theme="dark"] {{
+    --bg: #0a0a0f;
+    --bg2: #111118;
+    --glass: rgba(255,255,255,.06);
+    --glass2: rgba(255,255,255,.10);
+    --glass-hover: rgba(255,255,255,.14);
+    --border: rgba(255,255,255,.10);
+    --border-hover: rgba(255,255,255,.22);
+    --text: #f2f2f7;
+    --text2: #8e8e93;
+    --accent: #0a84ff;
+    --accent2: #5e5ce6;
+    --green: #30d158;
+    --orange: #ff9f0a;
+    --shadow: 0 8px 32px rgba(0,0,0,.45);
+    --shadow-hover: 0 12px 40px rgba(10,132,255,.25);
+    --radius: 16px;
+    --blur: 24px;
+  }}
+
+  [data-theme="light"] {{
+    --bg: #f2f2f7;
+    --bg2: #ffffff;
+    --glass: rgba(255,255,255,.72);
+    --glass2: rgba(255,255,255,.88);
+    --glass-hover: rgba(255,255,255,.95);
+    --border: rgba(0,0,0,.08);
+    --border-hover: rgba(0,0,0,.18);
+    --text: #1c1c1e;
+    --text2: #6e6e73;
+    --accent: #007aff;
+    --accent2: #5856d6;
+    --green: #28a745;
+    --orange: #ff9500;
+    --shadow: 0 4px 24px rgba(0,0,0,.10);
+    --shadow-hover: 0 8px 32px rgba(0,122,255,.22);
+    --radius: 16px;
+    --blur: 24px;
+  }}
+
+  html {{ font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
+         "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+         -webkit-font-smoothing: antialiased; }}
+
+  body {{
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 1.5rem;
+    transition: background .4s, color .4s;
+  }}
+
+  body::before {{
+    content: "";
+    position: fixed; inset: 0;
+    background:
+      radial-gradient(ellipse 80% 50% at 20% 0%, rgba(10,132,255,.15), transparent),
+      radial-gradient(ellipse 60% 40% at 80% 100%, rgba(94,92,230,.12), transparent);
+    pointer-events: none;
+    z-index: 0;
+  }}
+  [data-theme="light"] body::before {{
+    background:
+      radial-gradient(ellipse 80% 50% at 20% 0%, rgba(0,122,255,.08), transparent),
+      radial-gradient(ellipse 60% 40% at 80% 100%, rgba(88,86,214,.06), transparent);
+  }}
+
+  .wrap {{
+    position: relative; z-index: 1;
+    max-width: 720px; margin: 0 auto;
+  }}
+
+  /* ---- header ---- */
+  .header {{
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 1.5rem;
+  }}
+  .header h1 {{
+    font-size: 1.5rem; font-weight: 700; letter-spacing: -.02em;
+  }}
+  .path {{
+    color: var(--text2); font-size: .82rem; margin-bottom: 1.5rem;
+    word-break: break-all; font-weight: 500;
+    padding: .6rem .9rem;
+    background: var(--glass);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    backdrop-filter: blur(var(--blur));
+    -webkit-backdrop-filter: blur(var(--blur));
+  }}
+
+  /* ---- theme toggle ---- */
+  .theme-btn {{
+    width: 44px; height: 44px; border-radius: 50%;
+    border: 1px solid var(--border);
+    background: var(--glass);
+    backdrop-filter: blur(var(--blur));
+    -webkit-backdrop-filter: blur(var(--blur));
+    color: var(--text);
+    font-size: 1.15rem; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: all .3s cubic-bezier(.4,0,.2,1);
+    flex-shrink: 0;
+  }}
+  .theme-btn:hover {{
+    background: var(--glass-hover);
+    border-color: var(--border-hover);
+    transform: scale(1.08) rotate(15deg);
+    box-shadow: var(--shadow-hover);
+  }}
+  .theme-btn:active {{ transform: scale(.95); }}
+
+  /* ---- file cards ---- */
+  .cards {{
+    display: flex; flex-direction: column; gap: .6rem;
+  }}
+
+  .card {{
+    display: flex; align-items: center; gap: .9rem;
+    padding: .9rem 1.1rem;
+    background: var(--glass);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    backdrop-filter: blur(var(--blur));
+    -webkit-backdrop-filter: blur(var(--blur));
+    text-decoration: none; color: var(--text);
+    transition: all .25s cubic-bezier(.4,0,.2,1);
+    position: relative;
+    overflow: hidden;
+  }}
+  .card::before {{
+    content: "";
+    position: absolute; inset: 0;
+    background: linear-gradient(135deg, rgba(255,255,255,.06), transparent 60%);
+    opacity: 0; transition: opacity .3s;
+    pointer-events: none;
+  }}
+  .card:hover {{
+    background: var(--glass-hover);
+    border-color: var(--border-hover);
+    transform: translateY(-2px) scale(1.01);
+    box-shadow: var(--shadow-hover);
+  }}
+  .card:hover::before {{ opacity: 1; }}
+  .card:active {{ transform: translateY(0) scale(.99); }}
+
+  .card .icon {{
+    font-size: 1.4rem; width: 36px; height: 36px;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--glass2);
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    flex-shrink: 0;
+    transition: all .3s;
+  }}
+  .card:hover .icon {{
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+    transform: scale(1.1);
+  }}
+  .card.dir:hover .icon {{
+    background: var(--orange);
+    border-color: var(--orange);
+  }}
+
+  .card .name {{
+    flex: 1; font-weight: 500; font-size: .92rem;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    transition: color .2s;
+  }}
+  .card:hover .name {{ color: var(--accent); }}
+  .card.dir:hover .name {{ color: var(--orange); }}
+
+  .card .size {{
+    color: var(--text2); font-size: .78rem; font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    background: var(--glass2);
+    padding: .2rem .55rem;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    transition: all .3s;
+    flex-shrink: 0;
+  }}
+  .card:hover .size {{
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }}
+
+  .card .dl {{
+    font-size: 1.1rem; color: var(--text2);
+    opacity: 0; transform: translateX(-8px);
+    transition: all .3s cubic-bezier(.4,0,.2,1);
+    flex-shrink: 0; width: 20px; text-align: center;
+  }}
+  .card:hover .dl {{
+    opacity: 1; transform: translateX(0);
+    color: var(--green);
+  }}
+
+  .empty {{
+    text-align: center; color: var(--text2);
+    padding: 3rem 1rem; font-size: .95rem;
+    background: var(--glass);
+    border: 1px dashed var(--border);
+    border-radius: var(--radius);
+    backdrop-filter: blur(var(--blur));
+  }}
+
+  footer {{
+    margin-top: 1.5rem; text-align: center;
+    color: var(--text2); font-size: .72rem; font-weight: 500;
+    opacity: .7;
+  }}
+
+  /* ---- responsive ---- */
+  @media (max-width: 480px) {{
+    body {{ padding: .75rem; }}
+    .header h1 {{ font-size: 1.2rem; }}
+    .card {{ padding: .75rem .85rem; gap: .7rem; }}
+    .card .icon {{ width: 32px; height: 32px; font-size: 1.15rem; }}
+    .card .name {{ font-size: .84rem; }}
+  }}
+
+  /* ---- entrance animation ---- */
+  .card {{ animation: fadeUp .4s ease both; }}
+  .card:nth-child(1) {{ animation-delay: .02s; }}
+  .card:nth-child(2) {{ animation-delay: .05s; }}
+  .card:nth-child(3) {{ animation-delay: .08s; }}
+  .card:nth-child(4) {{ animation-delay: .11s; }}
+  .card:nth-child(5) {{ animation-delay: .14s; }}
+  .card:nth-child(6) {{ animation-delay: .17s; }}
+  .card:nth-child(7) {{ animation-delay: .20s; }}
+  .card:nth-child(8) {{ animation-delay: .23s; }}
+  .card:nth-child(9) {{ animation-delay: .26s; }}
+  .card:nth-child(10) {{ animation-delay: .29s; }}
+
+  @keyframes fadeUp {{
+    from {{ opacity: 0; transform: translateY(12px); }}
+    to {{ opacity: 1; transform: translateY(0); }}
+  }}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>Downloads</h1>
+  <div class="header">
+    <h1>&#9679; Black Server</h1>
+    <button class="theme-btn" id="themeBtn" title="Toggle theme"
+            onclick="toggleTheme()">&#127769;</button>
+  </div>
   <div class="path">{html.escape(display_path)}</div>
-  <hr>
-  <table>
-    <tbody>
+  <div class="cards">
 {body_rows}
-    </tbody>
-  </table>
-  <footer>Served via Cloudflare Quick Tunnel &middot; read-only</footer>
+  </div>
+  <footer>Served via Black Server &middot; read-only</footer>
 </div>
+<script>
+(function(){{
+  var t = localStorage.getItem('bs-theme');
+  if (t === 'light' || t === 'dark')
+    document.documentElement.setAttribute('data-theme', t);
+  updateIcon();
+}})();
+function toggleTheme(){{
+  var el = document.documentElement;
+  var cur = el.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+  el.setAttribute('data-theme', cur);
+  localStorage.setItem('bs-theme', cur);
+  updateIcon();
+}}
+function updateIcon(){{
+  var t = document.documentElement.getAttribute('data-theme');
+  document.getElementById('themeBtn').innerHTML =
+    t === 'light' ? '&#127769;' : '&#127761;';
+}}
+</script>
 </body>
 </html>
 """
