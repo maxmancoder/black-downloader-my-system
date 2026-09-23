@@ -842,7 +842,8 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
       * the root directory is fixed to ``./downloads``;
       * path traversal / symlink escapes are rejected;
       * dot-files (e.g. ``.env``, ``.gitignore``) are never served;
-      * only GET/HEAD are implemented - there is no upload or admin API.
+      * GET/HEAD serve files; POST supports upload / mkdir / create only
+        (no admin API, names are validated against traversal).
     """
 
     server_version = "BlackServer/1.0"
@@ -881,6 +882,395 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
         except ValueError:
             return True
         return any(part.startswith(".") for part in relative.parts)
+
+    @staticmethod
+    def _safe_name(raw: str, *, allow_basename: bool = False) -> Optional[str]:
+        """Validate a user-supplied file/folder name (no traversal).
+
+        With ``allow_basename`` (uploads) a client path is reduced to its
+        final component; otherwise any path separator is rejected.
+        """
+        name = (raw or "").strip()
+        if not allow_basename:
+            name = name.replace("\\", "/")
+            if "/" in name or name in (".", "..") or ".." in name:
+                return None
+        else:
+            name = name.replace("\\", "/").split("/")[-1].strip()
+            if not name or name in (".", ".."):
+                return None
+        if not name or name in (".", ".."):
+            return None
+        if any(ch in name for ch in '<>:"|?*\x00'):
+            return None
+        if len(name) > 200:
+            return None
+        return name
+
+    def _json_response(self, code: int, obj: dict) -> None:
+        data = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _read_body(self) -> bytes:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 200 * 1024 * 1024:  # 200 MB cap
+            return b""
+        return self.rfile.read(length)
+
+    def _target_dir(self) -> Optional[Path]:
+        """Directory that POST operations act on (current listing path)."""
+        path = self._resolve_path()
+        if path is None:
+            return None
+        if path.is_file():
+            path = path.parent
+        if not path.is_dir() or self._is_hidden(path):
+            return None
+        return path
+
+    # -- POST: upload / mkdir / create ------------------------------------
+    def do_POST(self):  # noqa: N802
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        api = (query.get("__api") or [""])[0]
+        if api == "upload":
+            return self._handle_upload()
+        if api == "mkdir":
+            return self._handle_mkdir()
+        if api == "create":
+            return self._handle_create()
+        if api == "delete":
+            return self._handle_delete()
+        if api == "rename":
+            return self._handle_rename()
+        if api == "move":
+            return self._handle_move()
+        if api == "copy":
+            return self._handle_copy()
+        if api == "tree":
+            return self._handle_tree()
+        self._json_response(HTTPStatus.NOT_FOUND, {"ok": False, "error": "unknown route"})
+
+    def _handle_upload(self):
+        target = self._target_dir()
+        if target is None:
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "bad directory"})
+            return
+        ctype = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in ctype:
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "expected multipart"})
+            return
+        body = self._read_body()
+        if not body:
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "empty body"})
+            return
+        boundary_m = re.search(r'boundary="?([^";]+)"?', ctype)
+        if not boundary_m:
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "no boundary"})
+            return
+        boundary = boundary_m.group(1).encode("utf-8", "replace")
+        saved = []
+        for part in body.split(b"--" + boundary):
+            if b"Content-Disposition" not in part:
+                continue
+            fn_m = re.search(br'filename="([^"]*)"', part)
+            if not fn_m:
+                # RFC 5987 filename*
+                fn_m = re.search(br"filename\*=UTF-8''([^\r\n;]+)", part)
+                if not fn_m:
+                    continue
+                try:
+                    fname = urllib.parse.unquote(fn_m.group(1).decode("utf-8", "replace"))
+                except Exception:
+                    continue
+            else:
+                try:
+                    fname = fn_m.group(1).decode("utf-8")
+                except UnicodeDecodeError:
+                    fname = fn_m.group(1).decode("latin-1")
+            safe = self._safe_name(Path(fname).name, allow_basename=True)
+            if not safe:
+                continue
+            header_end = part.find(b"\r\n\r\n")
+            if header_end < 0:
+                continue
+            content = part[header_end + 4:]
+            # strip trailing CRLF that belongs to the multipart framing
+            if content.endswith(b"\r\n"):
+                content = content[:-2]
+            dest = target / safe
+            # avoid silent overwrite of a different existing name? keep simple: overwrite allowed
+            try:
+                dest.write_bytes(content)
+                saved.append(safe)
+            except OSError as exc:
+                logger.warning("upload failed for %s: %s", safe, exc)
+        if not saved:
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "no file received"})
+            return
+        logger.info("Uploaded %s -> %s", ", ".join(saved), target)
+        self._json_response(HTTPStatus.OK, {"ok": True, "files": saved})
+
+    def _handle_mkdir(self):
+        target = self._target_dir()
+        if target is None:
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "bad directory"})
+            return
+        try:
+            payload = json.loads(self._read_body().decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        name = self._safe_name(str(payload.get("name", "")))
+        if not name:
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid folder name"})
+            return
+        dest = target / name
+        if dest.exists():
+            self._json_response(HTTPStatus.CONFLICT, {"ok": False, "error": "already exists"})
+            return
+        try:
+            dest.mkdir(parents=False, exist_ok=False)
+        except OSError as exc:
+            self._json_response(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+            return
+        logger.info("Created folder %s in %s", name, target)
+        self._json_response(HTTPStatus.OK, {"ok": True, "name": name})
+
+    def _handle_create(self):
+        target = self._target_dir()
+        if target is None:
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "bad directory"})
+            return
+        try:
+            payload = json.loads(self._read_body().decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        raw = str(payload.get("name", "")).strip()
+        # default extension .txt when none provided
+        if raw and "." not in Path(raw).name:
+            raw = raw + ".txt"
+        name = self._safe_name(raw)
+        if not name:
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid file name"})
+            return
+        dest = target / name
+        if dest.exists():
+            self._json_response(HTTPStatus.CONFLICT, {"ok": False, "error": "already exists"})
+            return
+        try:
+            dest.write_bytes(b"")
+        except OSError as exc:
+            self._json_response(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+            return
+        logger.info("Created file %s in %s", name, target)
+        self._json_response(HTTPStatus.OK, {"ok": True, "name": name})
+
+    def _payload(self) -> dict:
+        try:
+            data = json.loads(self._read_body().decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _item_in(self, target: Path, name: str) -> Optional[Path]:
+        """Resolve *name* inside *target*, ensuring containment."""
+        safe = self._safe_name(name)
+        if not safe:
+            return None
+        item = (target / safe).resolve()
+        root = DOWNLOADS_DIR.resolve()
+        if item != root and root not in item.parents:
+            return None
+        if self._is_hidden(item):
+            return None
+        return item
+
+    def _dest_dir(self, dest: str) -> Optional[Path]:
+        """Resolve a destination folder path relative to downloads root."""
+        raw = (dest or "/").strip().replace("\\", "/")
+        if not raw.startswith("/"):
+            raw = "/" + raw
+        parts = [p for p in raw.split("/") if p and p != "."]
+        if any(p == ".." for p in parts):
+            return None
+        candidate = DOWNLOADS_DIR.resolve()
+        for p in parts:
+            safe = self._safe_name(p)
+            if not safe:
+                return None
+            candidate = candidate / safe
+        try:
+            candidate = candidate.resolve()
+        except OSError:
+            return None
+        root = DOWNLOADS_DIR.resolve()
+        if candidate != root and root not in candidate.parents:
+            return None
+        if not candidate.is_dir() or self._is_hidden(candidate):
+            return None
+        return candidate
+
+    def _handle_delete(self):
+        target = self._target_dir()
+        if target is None:
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "bad directory"})
+            return
+        payload = self._payload()
+        item = self._item_in(target, str(payload.get("name", "")))
+        if item is None or not item.exists():
+            self._json_response(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
+            return
+        if item.resolve() == DOWNLOADS_DIR.resolve():
+            self._json_response(HTTPStatus.FORBIDDEN, {"ok": False, "error": "cannot delete root"})
+            return
+        try:
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+        except OSError as exc:
+            self._json_response(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+            return
+        logger.info("Deleted %s", item)
+        self._json_response(HTTPStatus.OK, {"ok": True, "name": item.name})
+
+    def _handle_rename(self):
+        target = self._target_dir()
+        if target is None:
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "bad directory"})
+            return
+        payload = self._payload()
+        item = self._item_in(target, str(payload.get("name", "")))
+        if item is None or not item.exists():
+            self._json_response(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
+            return
+        new_name = self._safe_name(str(payload.get("newName", "")))
+        if not new_name:
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid new name"})
+            return
+        dest = target / new_name
+        if dest.exists() and dest.resolve() != item.resolve():
+            self._json_response(HTTPStatus.CONFLICT, {"ok": False, "error": "already exists"})
+            return
+        if dest.resolve() == item.resolve():
+            self._json_response(HTTPStatus.OK, {"ok": True, "name": new_name})
+            return
+        try:
+            item.rename(dest)
+        except OSError as exc:
+            self._json_response(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+            return
+        logger.info("Renamed %s -> %s", item.name, new_name)
+        self._json_response(HTTPStatus.OK, {"ok": True, "name": new_name})
+
+    def _handle_move(self):
+        target = self._target_dir()
+        if target is None:
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "bad directory"})
+            return
+        payload = self._payload()
+        item = self._item_in(target, str(payload.get("name", "")))
+        if item is None or not item.exists():
+            self._json_response(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
+            return
+        dest_dir = self._dest_dir(str(payload.get("dest", "/")))
+        if dest_dir is None:
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid destination"})
+            return
+        dest = dest_dir / item.name
+        try:
+            if dest.resolve() == item.resolve():
+                self._json_response(HTTPStatus.OK, {"ok": True, "name": item.name, "dest": str(payload.get("dest"))})
+                return
+            if dest.exists():
+                self._json_response(HTTPStatus.CONFLICT, {"ok": False, "error": "already exists at destination"})
+                return
+            # prevent moving a folder into itself / its child
+            if item.is_dir():
+                try:
+                    item.resolve().relative_to(dest_dir.resolve())
+                    self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "cannot move into itself"})
+                    return
+                except ValueError:
+                    pass
+            shutil.move(str(item), str(dest))
+        except OSError as exc:
+            self._json_response(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+            return
+        logger.info("Moved %s -> %s", item, dest)
+        self._json_response(HTTPStatus.OK, {"ok": True, "name": item.name, "dest": dest_dir.name or "/"})
+
+    def _handle_copy(self):
+        target = self._target_dir()
+        if target is None:
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "bad directory"})
+            return
+        payload = self._payload()
+        item = self._item_in(target, str(payload.get("name", "")))
+        if item is None or not item.exists():
+            self._json_response(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
+            return
+        dest_dir = self._dest_dir(str(payload.get("dest", "/")))
+        if dest_dir is None:
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid destination"})
+            return
+        dest = dest_dir / item.name
+        if dest.exists():
+            self._json_response(HTTPStatus.CONFLICT, {"ok": False, "error": "already exists at destination"})
+            return
+        if item.is_dir():
+            try:
+                item.resolve().relative_to(dest_dir.resolve())
+                self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "cannot copy into itself"})
+                return
+            except ValueError:
+                pass
+        try:
+            if item.is_dir():
+                shutil.copytree(item, dest)
+            else:
+                shutil.copy2(item, dest)
+        except OSError as exc:
+            self._json_response(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+            return
+        logger.info("Copied %s -> %s", item, dest)
+        self._json_response(HTTPStatus.OK, {"ok": True, "name": item.name, "dest": dest_dir.name or "/"})
+
+    def _handle_tree(self):
+        """JSON tree of all folders under downloads (for move/copy dest picker)."""
+        root = DOWNLOADS_DIR.resolve()
+
+        def walk(directory: Path) -> dict:
+            rel = "/" + directory.relative_to(root).as_posix().lstrip("./")
+            if rel == "/.":
+                rel = "/"
+            node = {"name": directory.name or "/", "path": rel, "dirs": []}
+            try:
+                subdirs = sorted(
+                    (
+                        p for p in directory.iterdir()
+                        if p.is_dir() and not p.name.startswith(".")
+                    ),
+                    key=lambda p: p.name.lower(),
+                )
+            except OSError:
+                subdirs = []
+            for sd in subdirs:
+                node["dirs"].append(walk(sd))
+            return node
+
+        self._json_response(HTTPStatus.OK, {"ok": True, "tree": walk(root)})
 
     # -- request handling -------------------------------------------------
     def send_head(self):
@@ -1074,7 +1464,9 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
 
         if has_parent:
             rows.append(
-                '<div class="frow dir" data-href="../" onclick="goParent()" '
+                '<div class="frow dir parent-row" data-href="../" data-name=".." '
+                'data-kind="0" data-size="-1" data-mtime="0" '
+                'onclick="goParent()" '
                 'onmouseenter="hoverRow(this)" onmouseleave="unhoverRow(this)">'
                 '<div class="fcell fname">'
                 '<span class="badge folder">&#8617;</span>'
@@ -1082,7 +1474,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
                 '<span class="fsub">Parent folder</span></span></div>'
                 '<div class="fcell fsize">&mdash;</div>'
                 '<div class="fcell fmtime">&mdash;</div>'
-                '<div class="fcell fdot"><span class="dots">&#8943;</span></div>'
+                '<div class="fcell fdot"></div>'
                 "</div>"
             )
 
@@ -1101,7 +1493,8 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             if full.is_dir():
                 href = link + "/"
                 rows.append(
-                    f'<div class="frow dir" data-href="{href}" '
+                    f'<div class="frow dir" data-href="{href}" data-name="{label}" '
+                    f'data-kind="1" data-size="-1" data-mtime="{int(mtime)}" '
                     f'onclick="goDir(\'{href}\')" '
                     f'onmouseenter="hoverRow(this)" onmouseleave="unhoverRow(this)">'
                     f'<div class="fcell fname">'
@@ -1110,7 +1503,9 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
                     f'<span class="fsub">Folder</span></span></div>'
                     f'<div class="fcell fsize">&mdash;</div>'
                     f'<div class="fcell fmtime">{_fmt_mtime(mtime)}</div>'
-                    f'<div class="fcell fdot"><span class="dots">&#8943;</span></div>'
+                    f'<div class="fcell fdot">'
+                    f'<button class="dots" type="button" title="More" '
+                    f'onclick="openRowMenu(event, this)">&#8943;</button></div>'
                     f"</div>"
                 )
             else:
@@ -1128,14 +1523,17 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
                     "sizeB": size_b,
                     "type": type_label,
                     "mtime": _fmt_mtime(mtime),
+                    "mtimeTs": int(mtime),
                     "perm": perms,
                     "path": rel_path,
                     "ext": ext.lstrip(".") or "file",
-                })
+                }, ensure_ascii=False)
                 if first_file_json == "null":
                     first_file_json = meta
                 rows.append(
                     f'<div class="frow file" data-meta=\'{meta}\' '
+                    f'data-name="{label}" data-kind="2" data-size="{size_b}" '
+                    f'data-mtime="{int(mtime)}" '
                     f'onclick="selectFile(this)" '
                     f'onmouseenter="hoverRow(this)" onmouseleave="unhoverRow(this)">'
                     f'<div class="fcell fname">{badge}'
@@ -1143,7 +1541,9 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
                     f'<span class="fsub">{type_label} &middot; {size_str}</span></span></div>'
                     f'<div class="fcell fsize">{size_str}</div>'
                     f'<div class="fcell fmtime">{_fmt_mtime(mtime)}</div>'
-                    f'<div class="fcell fdot"><span class="dots">&#8943;</span></div>'
+                    f'<div class="fcell fdot">'
+                    f'<button class="dots" type="button" title="More" '
+                    f'onclick="openRowMenu(event, this)">&#8943;</button></div>'
                     f"</div>"
                 )
 
@@ -1158,7 +1558,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             body_rows = "\n".join(rows)
 
         page = f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1167,7 +1567,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
 <style>
   *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
 
-  :root {{
+  :root, [data-theme="dark"] {{
     --bg: #070b14;
     --bg2: #0b1120;
     --panel: #0e1628;
@@ -1190,7 +1590,50 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     --hover: rgba(59,130,246,.07);
     --radius: 14px;
     --shadow: 0 8px 32px rgba(0,0,0,.45);
+    --sidebar-bg: rgba(0,0,0,.18);
+    --details-bg: rgba(0,0,0,.22);
+    --mbar-bg: #1a2744;
+    --switch-bg: #1a2744;
+    --switch-knob: #f8fafc;
+    --glass-bg: rgba(14,22,40,.92);
+    --input-bg: #0e1628;
+    --body-transition: background .45s ease, color .45s ease;
   }}
+
+  [data-theme="light"] {{
+    --bg: #eef1f6;
+    --bg2: #f7f8fb;
+    --panel: #ffffff;
+    --panel2: #f3f5f9;
+    --panel3: #e8ecf4;
+    --border: #dde3ee;
+    --border2: #c9d2e3;
+    --text: #152038;
+    --text2: #5a6a88;
+    --text3: #8b98b3;
+    --blue: #3b82f6;
+    --blue2: #2563eb;
+    --green: #16a34a;
+    --purple: #8b5cf6;
+    --pink: #ec4899;
+    --teal: #14b8a6;
+    --orange: #f59e0b;
+    --sel: rgba(59,130,246,.12);
+    --sel-border: rgba(59,130,246,.5);
+    --hover: rgba(59,130,246,.06);
+    --radius: 14px;
+    --shadow: 0 8px 28px rgba(20,35,70,.12);
+    --sidebar-bg: #f7f8fb;
+    --details-bg: #f7f8fb;
+    --mbar-bg: #e4e9f2;
+    --switch-bg: #d8dfecc;
+    --switch-knob: #ffffff;
+    --glass-bg: rgba(255,255,255,.88);
+    --input-bg: #ffffff;
+    --body-transition: background .45s ease, color .45s ease;
+  }}
+  /* fix typo-safe: real value */
+  [data-theme="light"] {{ --switch-bg: #d8dfec; }}
 
   html {{ font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
          -webkit-font-smoothing: antialiased; }}
@@ -1200,6 +1643,13 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     color: var(--text);
     min-height: 100vh;
     padding: 18px;
+    transition: var(--body-transition);
+  }}
+  body, .app, .topbar, .machine, .metric, .gear, .search input,
+  .sidebar, .center, .details, .meta-table, .sort-menu, .view-toggle,
+  .sort-btn, .btn, .list-tools, .thead, .toast {{
+    transition: background .45s ease, color .45s ease,
+                border-color .45s ease, box-shadow .45s ease;
   }}
 
   /* ===== TOP BAR ===== */
@@ -1219,7 +1669,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     width: 100%; padding: 12px 16px 12px 42px;
     background: var(--panel); border: 1px solid var(--border);
     border-radius: 12px; color: var(--text); font-size: 14px;
-    outline: none; transition: border-color .2s, box-shadow .2s;
+    outline: none; transition: border-color .2s, box-shadow .2s, background .45s;
   }}
   .search input::placeholder {{ color: var(--text3); }}
   .search input:focus {{
@@ -1229,6 +1679,67 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   .top-right {{
     margin-left: auto; display: flex; align-items: center; gap: 12px;
   }}
+
+  /* ===== THEME DRAWER SWITCH ===== */
+  .theme-switch {{
+    position: relative; width: 64px; height: 34px; flex-shrink: 0;
+    background: var(--switch-bg);
+    border: 1px solid var(--border);
+    border-radius: 999px; cursor: pointer;
+    box-shadow: inset 0 2px 6px rgba(0,0,0,.25);
+    transition: background .4s cubic-bezier(.4,0,.2,1),
+                border-color .4s ease, box-shadow .4s ease;
+    padding: 0; outline: none;
+  }}
+  [data-theme="light"] .theme-switch {{
+    box-shadow: inset 0 2px 6px rgba(20,35,70,.12);
+  }}
+  .theme-switch .knob {{
+    position: absolute; top: 3px; left: 3px;
+    width: 26px; height: 26px; border-radius: 50%;
+    background: var(--switch-knob);
+    box-shadow: 0 2px 8px rgba(0,0,0,.3);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; line-height: 1;
+    transition: transform .45s cubic-bezier(.34,1.4,.5,1),
+                background .4s ease, box-shadow .4s ease;
+    z-index: 2;
+  }}
+  [data-theme="light"] .theme-switch .knob {{
+    transform: translateX(30px);
+    box-shadow: 0 2px 10px rgba(20,35,70,.2);
+  }}
+  .theme-switch .icon-moon, .theme-switch .icon-sun {{
+    position: absolute; top: 50%; transform: translateY(-50%);
+    font-size: 12px; opacity: .55;
+    transition: opacity .35s ease, transform .45s cubic-bezier(.34,1.4,.5,1);
+    pointer-events: none;
+  }}
+  .theme-switch .icon-sun {{ right: 9px; opacity: 0; transform: translateY(-50%) rotate(-90deg) scale(.5); }}
+  .theme-switch .icon-moon {{ left: 9px; opacity: .7; }}
+  [data-theme="light"] .theme-switch .icon-sun {{
+    opacity: .75; transform: translateY(-50%) rotate(0deg) scale(1);
+  }}
+  [data-theme="light"] .theme-switch .icon-moon {{
+    opacity: 0; transform: translateY(-50%) rotate(90deg) scale(.5);
+  }}
+  .theme-switch:hover .knob {{ box-shadow: 0 3px 12px rgba(59,130,246,.4); }}
+  .theme-switch:active .knob {{ width: 30px; }}
+  [data-theme="light"] .theme-switch:active .knob {{
+    transform: translateX(26px); width: 30px;
+  }}
+  /* soft sliding track glow */
+  .theme-switch::after {{
+    content: ""; position: absolute; inset: 3px;
+    border-radius: 999px; pointer-events: none;
+    background: linear-gradient(90deg, rgba(59,130,246,.35), transparent 55%);
+    opacity: 1; transition: opacity .4s ease, transform .45s ease;
+  }}
+  [data-theme="light"] .theme-switch::after {{
+    background: linear-gradient(90deg, transparent, rgba(245,158,11,.4));
+    opacity: 1;
+  }}
+
   .machine {{
     display: flex; align-items: center; gap: 10px;
     background: var(--panel); border: 1px solid var(--border);
@@ -1258,7 +1769,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     color: var(--text2); margin-bottom: 4px;
   }}
   .metric .mbar {{
-    height: 5px; border-radius: 3px; background: #1a2744; overflow: hidden;
+    height: 5px; border-radius: 3px; background: var(--mbar-bg); overflow: hidden;
   }}
   .metric .mbar i {{
     display: block; height: 100%; border-radius: 3px;
@@ -1283,6 +1794,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     box-shadow: var(--shadow);
     overflow: hidden;
     animation: rise .45s cubic-bezier(.16,1,.3,1) both;
+    transition: background .45s ease, border-color .45s ease, box-shadow .45s ease;
   }}
   @keyframes rise {{
     from {{ opacity: 0; transform: translateY(16px); }}
@@ -1328,7 +1840,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
 
   /* ---- sidebar tree ---- */
   .sidebar {{
-    background: rgba(0,0,0,.18);
+    background: var(--sidebar-bg);
     border-right: 1px solid var(--border);
     padding: 14px 10px;
     overflow-y: auto;
@@ -1459,12 +1971,18 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     font-variant-numeric: tabular-nums;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }}
-  .fdot {{ text-align: center; }}
+  .fdot {{ text-align: center; position: relative; }}
   .dots {{
     color: var(--text3); font-size: 18px; letter-spacing: 1px;
-    opacity: 0; transition: opacity .15s;
+    opacity: 0; transition: opacity .15s, color .15s, background .15s;
+    background: transparent; border: none; cursor: pointer;
+    width: 32px; height: 28px; border-radius: 8px;
+    display: inline-flex; align-items: center; justify-content: center;
+    padding: 0; line-height: 1;
   }}
-  .frow:hover .dots {{ opacity: 1; }}
+  .frow:hover .dots, .dots.open {{ opacity: 1; }}
+  .dots:hover {{ color: var(--text); background: var(--panel3); }}
+  .parent-row .dots {{ display: none; }}
 
   /* file type badges */
   .badge {{
@@ -1504,7 +2022,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
 
   /* ---- right details panel ---- */
   .details {{
-    background: rgba(0,0,0,.22);
+    background: var(--details-bg);
     padding: 22px 18px;
     overflow-y: auto;
     display: flex; flex-direction: column; gap: 22px;
@@ -1604,23 +2122,38 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   /* ---- grid view ---- */
   .tbody.grid-view {{
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
     gap: 10px; padding: 12px;
+    align-content: start;
   }}
   .tbody.grid-view .frow {{
     display: flex; flex-direction: column; text-align: center;
-    gap: 8px; padding: 16px 8px 12px;
+    gap: 8px; padding: 18px 8px 14px;
     grid-template-columns: none;
+    min-height: 120px;
+    justify-content: center;
+    position: relative;
   }}
   .tbody.grid-view .fcell.fsize,
-  .tbody.grid-view .fcell.fmtime,
-  .tbody.grid-view .fcell.fdot {{ display: none; }}
-  .tbody.grid-view .fname {{
-    flex-direction: column; gap: 8px;
+  .tbody.grid-view .fcell.fmtime {{ display: none; }}
+  .tbody.grid-view .fcell.fdot {{
+    display: block;
+    position: absolute; top: 6px; right: 6px;
+    width: auto; text-align: center;
   }}
-  .tbody.grid-view .badge {{ width: 52px; height: 52px; border-radius: 14px; font-size: 14px; }}
-  .tbody.grid-view .ftext {{ align-items: center; }}
-  .tbody.grid-view .fsub {{ display: none; }}
+  .tbody.grid-view .dots {{ opacity: 1; width: 28px; height: 28px; font-size: 16px; }}
+  .tbody.grid-view .fname {{
+    flex-direction: column; gap: 8px; width: 100%;
+  }}
+  .tbody.grid-view .badge {{ width: 52px; height: 52px; border-radius: 14px; font-size: 14px; margin: 0 auto; }}
+  .tbody.grid-view .ftext {{ align-items: center; width: 100%; }}
+  .tbody.grid-view .flabel {{
+    white-space: normal; word-break: break-word; line-height: 1.3;
+    max-height: 2.6em; overflow: hidden;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  }}
+  .tbody.grid-view .fsub {{ display: block; font-size: 10.5px; }}
+  .tbody.grid-view .empty-state {{ grid-column: 1 / -1; }}
 
   /* ---- toast ---- */
   .toast {{
@@ -1634,6 +2167,221 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     pointer-events: none;
   }}
   .toast.show {{ opacity: 1; transform: translateX(-50%) translateY(0); }}
+
+  /* ===== ROW CONTEXT MENU ===== */
+  .ctx-menu {{
+    position: fixed; z-index: 300;
+    min-width: 180px;
+    background: var(--glass-bg);
+    border: 1px solid var(--border2);
+    border-radius: 14px;
+    box-shadow: 0 16px 48px rgba(0,0,0,.4), inset 0 1px 0 rgba(255,255,255,.06);
+    backdrop-filter: blur(24px) saturate(1.3);
+    -webkit-backdrop-filter: blur(24px) saturate(1.3);
+    padding: 6px;
+    display: none;
+    transform-origin: top right;
+    animation: ctxIn .18s cubic-bezier(.16,1,.3,1) both;
+  }}
+  .ctx-menu.open {{ display: block; }}
+  @keyframes ctxIn {{
+    from {{ opacity: 0; transform: scale(.92) translateY(-6px); }}
+    to {{ opacity: 1; transform: scale(1) translateY(0); }}
+  }}
+  .ctx-item {{
+    display: flex; align-items: center; gap: 10px;
+    width: 100%; padding: 10px 12px;
+    background: transparent; border: none; border-radius: 9px;
+    color: var(--text); font-size: 13.5px; font-weight: 500;
+    cursor: pointer; text-align: left; font-family: inherit;
+    transition: background .12s;
+  }}
+  .ctx-item:hover {{ background: var(--hover); }}
+  .ctx-item.danger {{ color: #ff6b6b; }}
+  .ctx-item.danger:hover {{ background: rgba(255,80,80,.12); }}
+  .ctx-item .ci {{
+    width: 22px; text-align: center; font-size: 14px; opacity: .9;
+  }}
+  .ctx-sep {{
+    height: 1px; background: var(--border);
+    margin: 4px 8px;
+  }}
+  .ctx-title {{
+    font-size: 11px; font-weight: 700; color: var(--text3);
+    padding: 6px 12px 4px; letter-spacing: .04em;
+    text-transform: uppercase;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    max-width: 200px;
+  }}
+
+  /* ===== DEST PICKER (move/copy) ===== */
+  .dest-tree {{
+    max-height: 240px; overflow-y: auto;
+    background: var(--input-bg); border: 1.5px solid var(--border);
+    border-radius: 12px; padding: 8px; text-align: left;
+    margin-top: 4px;
+  }}
+  .dest-opt {{
+    display: flex; align-items: center; gap: 8px;
+    width: 100%; padding: 8px 10px;
+    background: transparent; border: none; border-radius: 8px;
+    color: var(--text2); font-size: 13.5px; font-family: inherit;
+    cursor: pointer; transition: all .12s; text-align: left;
+  }}
+  .dest-opt:hover {{ background: var(--hover); color: var(--text); }}
+  .dest-opt.on {{
+    background: var(--sel); color: #7db4ff; font-weight: 600;
+    outline: 1px solid var(--sel-border);
+  }}
+  .dest-opt .di {{ font-size: 14px; }}
+  .dest-indent {{ width: 14px; flex-shrink: 0; }}
+
+  /* ===== SETTINGS ===== */
+  .set-row {{
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; padding: 12px 14px;
+    background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 12px; margin-bottom: 10px;
+    text-align: right;
+  }}
+  .set-info {{ min-width: 0; }}
+  .set-info .st {{ font-size: 13.5px; font-weight: 600; color: var(--text); }}
+  .set-info .ss {{ font-size: 11.5px; color: var(--text3); margin-top: 2px; }}
+  .set-seg {{
+    display: flex; background: var(--input-bg);
+    border: 1px solid var(--border); border-radius: 9px;
+    overflow: hidden; flex-shrink: 0;
+  }}
+  .set-seg button {{
+    padding: 7px 12px; border: none; background: transparent;
+    color: var(--text3); font-size: 12px; font-weight: 600;
+    cursor: pointer; font-family: inherit; transition: all .15s;
+  }}
+  .set-seg button.on {{
+    background: var(--blue); color: #fff;
+  }}
+  .set-badge {{
+    font-size: 11px; font-weight: 700; color: var(--green);
+    background: rgba(34,197,94,.12); border: 1px solid rgba(34,197,94,.3);
+    padding: 4px 10px; border-radius: 999px;
+  }}
+  .set-brand {{
+    text-align: center; padding: 6px 0 14px;
+    border-bottom: 1px solid var(--border); margin-bottom: 14px;
+  }}
+  .set-brand .bn {{
+    font-size: 16px; font-weight: 800; letter-spacing: -.02em;
+  }}
+  .set-brand .bv {{
+    font-size: 11.5px; color: var(--text3); margin-top: 3px;
+  }}
+
+  /* ===== GLASS MODALS ===== */
+  .modal-back {{
+    position: fixed; inset: 0; z-index: 200;
+    background: rgba(5,10,25,.55);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    display: flex; align-items: center; justify-content: center;
+    opacity: 0; pointer-events: none;
+    transition: opacity .35s cubic-bezier(.16,1,.3,1);
+    padding: 16px;
+  }}
+  [data-theme="light"] .modal-back {{
+    background: rgba(20,30,60,.35);
+  }}
+  .modal-back.open {{ opacity: 1; pointer-events: auto; }}
+  .modal {{
+    background: var(--glass-bg);
+    border: 1px solid var(--border2);
+    border-radius: 22px;
+    box-shadow: 0 24px 64px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.08);
+    backdrop-filter: blur(28px) saturate(1.3);
+    -webkit-backdrop-filter: blur(28px) saturate(1.3);
+    padding: 28px 26px 24px;
+    width: 100%; max-width: 380px;
+    transform: translateY(24px) scale(.94);
+    transition: transform .4s cubic-bezier(.34,1.35,.5,1);
+    text-align: center;
+  }}
+  .modal-back.open .modal {{ transform: translateY(0) scale(1); }}
+  .modal h2 {{
+    font-size: 18px; font-weight: 700; margin-bottom: 6px;
+    color: var(--text);
+  }}
+  .modal .msub {{
+    font-size: 12.5px; color: var(--text2); margin-bottom: 20px;
+  }}
+  .choice-grid {{
+    display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+  }}
+  .choice {{
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+    padding: 22px 12px 18px;
+    background: var(--panel2); border: 1.5px solid var(--border);
+    border-radius: 16px; cursor: pointer;
+    color: var(--text); font-family: inherit;
+    transition: all .25s cubic-bezier(.16,1,.3,1);
+  }}
+  .choice:hover {{
+    border-color: var(--blue);
+    background: var(--sel);
+    transform: translateY(-4px);
+    box-shadow: 0 10px 28px rgba(59,130,246,.2);
+  }}
+  .choice:active {{ transform: translateY(-1px); }}
+  .choice .cico {{
+    width: 52px; height: 52px; border-radius: 15px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 24px; color: #fff;
+    box-shadow: 0 6px 18px rgba(0,0,0,.25);
+  }}
+  .choice .cico.folder {{ background: linear-gradient(135deg,#60a5fa,#3b82f6); }}
+  .choice .cico.file {{ background: linear-gradient(135deg,#a78bfa,#7c3aed); }}
+  .choice .clabel {{ font-size: 14px; font-weight: 700; }}
+  .choice .cdesc {{ font-size: 11px; color: var(--text3); }}
+
+  .field-label {{
+    display: block; text-align: right;
+    font-size: 12.5px; font-weight: 600; color: var(--text2);
+    margin-bottom: 8px;
+  }}
+  .field-input {{
+    width: 100%; padding: 13px 16px;
+    background: var(--input-bg); border: 1.5px solid var(--border);
+    border-radius: 12px; color: var(--text); font-size: 15px;
+    outline: none; text-align: left;
+    transition: border-color .2s, box-shadow .2s;
+    font-family: inherit;
+  }}
+  .field-input:focus {{
+    border-color: var(--blue);
+    box-shadow: 0 0 0 3px rgba(59,130,246,.2);
+  }}
+  .field-hint {{
+    font-size: 11.5px; color: var(--text3); margin-top: 8px;
+    text-align: right; min-height: 16px;
+  }}
+  .modal-actions {{
+    display: flex; gap: 10px; margin-top: 20px;
+  }}
+  .modal-actions .btn {{ flex: 1; justify-content: center; padding: 11px 14px; }}
+  .btn.ghost {{ background: transparent; }}
+  .btn.ok {{
+    background: linear-gradient(135deg, #4f8cff, #3b5bfc);
+    border: none; color: #fff;
+    box-shadow: 0 4px 16px rgba(79,140,255,.35);
+  }}
+  .btn.ok:hover {{ transform: translateY(-1px); box-shadow: 0 6px 20px rgba(79,140,255,.5); }}
+  .btn[disabled] {{ opacity: .5; pointer-events: none; }}
+  .spinner {{
+    display: inline-block; width: 14px; height: 14px;
+    border: 2px solid rgba(255,255,255,.35);
+    border-top-color: #fff; border-radius: 50%;
+    animation: spin .7s linear infinite; vertical-align: -2px;
+    margin-left: 6px;
+  }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
 
   /* ---- responsive ---- */
   @media (max-width: 980px) {{
@@ -1666,6 +2414,12 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
            oninput="filterRows()">
   </div>
   <div class="top-right">
+    <button class="theme-switch" id="themeSwitch" title="Toggle theme"
+            onclick="toggleTheme()" aria-label="Toggle theme">
+      <span class="icon-moon">&#9789;</span>
+      <span class="icon-sun">&#9728;</span>
+      <span class="knob" id="themeKnob">&#127769;</span>
+    </button>
     <div class="machine">
       <span class="mdot"></span>
       <div class="mtext">
@@ -1678,7 +2432,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
       <div class="metric ram"><div class="mlabel">RAM</div><div class="mbar"><i></i></div></div>
       <div class="metric disk"><div class="mlabel">DISK</div><div class="mbar"><i></i></div></div>
     </div>
-    <button class="gear" title="Settings" onclick="toast('Settings are not available yet')">&#9881;</button>
+    <button class="gear" title="Settings" onclick="openSettings()">&#9881;</button>
   </div>
 </div>
 
@@ -1690,12 +2444,13 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
       <div class="sub">Browse and manage your server files</div>
     </div>
     <div class="head-actions">
-      <button class="btn" onclick="toast('New Folder requires write access')">
-        &#128193; New Folder
+      <button class="btn" onclick="openNewModal()">
+        &#10010; جدید
       </button>
-      <button class="btn primary" onclick="toast('Upload requires write access')">
+      <button class="btn primary" onclick="document.getElementById('fileInput').click()">
         &#8682; Upload
       </button>
+      <input type="file" id="fileInput" multiple hidden onchange="uploadFiles(this.files)">
     </div>
   </div>
 
@@ -1790,6 +2545,151 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
 
 <div class="toast" id="toast"></div>
 
+<!-- row context menu -->
+<div class="ctx-menu" id="ctxMenu" role="menu">
+  <div class="ctx-title" id="ctxTitle"></div>
+  <button class="ctx-item" onclick="ctxAction('rename')"><span class="ci">&#9998;</span> تغییر نام</button>
+  <button class="ctx-item" onclick="ctxAction('move')"><span class="ci">&#8644;</span> انتقال</button>
+  <button class="ctx-item" onclick="ctxAction('copy')"><span class="ci">&#10697;</span> کپی</button>
+  <div class="ctx-sep"></div>
+  <button class="ctx-item danger" onclick="ctxAction('delete')"><span class="ci">&#128465;</span> حذف</button>
+</div>
+
+<!-- glass modal: new folder / new file choice -->
+<div class="modal-back" id="newModal" onclick="if(event.target===this)closeNewModal()">
+  <div class="modal" role="dialog" aria-modal="true">
+    <h2>ایجاد مورد جدید</h2>
+    <div class="msub">در مسیر فعلی ساخته می‌شود: <strong dir="ltr">{html.escape(display_path)}</strong></div>
+    <div class="choice-grid">
+      <button class="choice" onclick="openNameModal('folder')">
+        <span class="cico folder">&#128193;</span>
+        <span class="clabel">پوشه جدید</span>
+        <span class="cdesc">New folder</span>
+      </button>
+      <button class="choice" onclick="openNameModal('file')">
+        <span class="cico file">&#128196;</span>
+        <span class="clabel">فایل جدید</span>
+        <span class="cdesc">New file</span>
+      </button>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeNewModal()">انصراف</button>
+    </div>
+  </div>
+</div>
+
+<!-- glass modal: name prompt -->
+<div class="modal-back" id="nameModal" onclick="if(event.target===this)closeNameModal()">
+  <div class="modal" role="dialog" aria-modal="true">
+    <h2 id="nameTitle">نام را وارد کنید</h2>
+    <div class="msub" id="nameSub"></div>
+    <label class="field-label" for="nameInput" id="nameLabel">نام</label>
+    <input class="field-input" id="nameInput" type="text" autocomplete="off"
+           oninput="nameInputChanged()" onkeydown="if(event.key==='Enter')confirmName()">
+    <div class="field-hint" id="nameHint"></div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeNameModal()">انصراف</button>
+      <button class="btn ok" id="nameOk" onclick="confirmName()">تایید</button>
+    </div>
+  </div>
+</div>
+
+<!-- glass modal: delete confirm -->
+<div class="modal-back" id="delModal" onclick="if(event.target===this)closeDelModal()">
+  <div class="modal" role="dialog" aria-modal="true">
+    <h2>حذف مورد</h2>
+    <div class="msub">این عملیات برگشت‌پذیر نیست و از سرور هم پاک می‌شود.</div>
+    <div class="set-row" style="margin-top:4px">
+      <div class="set-info">
+        <div class="st" id="delName">&mdash;</div>
+        <div class="ss" id="delKind">&mdash;</div>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeDelModal()">انصراف</button>
+      <button class="btn ok" id="delOk" style="background:linear-gradient(135deg,#ff6b6b,#e11d48);box-shadow:0 4px 16px rgba(225,29,72,.35)"
+              onclick="confirmDelete()">حذف</button>
+    </div>
+  </div>
+</div>
+
+<!-- glass modal: rename -->
+<div class="modal-back" id="renModal" onclick="if(event.target===this)closeRenModal()">
+  <div class="modal" role="dialog" aria-modal="true">
+    <h2>تغییر نام</h2>
+    <div class="msub" id="renSub"></div>
+    <label class="field-label" for="renInput">نام جدید</label>
+    <input class="field-input" id="renInput" type="text" autocomplete="off"
+           onkeydown="if(event.key==='Enter')confirmRename()">
+    <div class="field-hint" id="renHint"></div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeRenModal()">انصراف</button>
+      <button class="btn ok" id="renOk" onclick="confirmRename()">تایید</button>
+    </div>
+  </div>
+</div>
+
+<!-- glass modal: move / copy destination -->
+<div class="modal-back" id="destModal" onclick="if(event.target===this)closeDestModal()">
+  <div class="modal" role="dialog" aria-modal="true">
+    <h2 id="destTitle">انتخاب مقصد</h2>
+    <div class="msub" id="destSub"></div>
+    <div class="dest-tree" id="destTree"></div>
+    <div class="field-hint" id="destHint">مقصد: /</div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeDestModal()">انصراف</button>
+      <button class="btn ok" id="destOk" onclick="confirmDest()">تایید</button>
+    </div>
+  </div>
+</div>
+
+<!-- glass modal: settings -->
+<div class="modal-back" id="setModal" onclick="if(event.target===this)closeSettings()">
+  <div class="modal" role="dialog" aria-modal="true">
+    <div class="set-brand">
+      <div class="bn">&#9679; Black Server My System</div>
+      <div class="bv">File Manager &middot; Settings</div>
+    </div>
+    <div class="set-row">
+      <div class="set-info">
+        <div class="st">تم رابط کاربری</div>
+        <div class="ss">روشن یا تیره — با انیمیشن نرم</div>
+      </div>
+      <div class="set-seg">
+        <button id="setDark" class="on" onclick="setTheme('dark')">&#9789; تیره</button>
+        <button id="setLight" onclick="setTheme('light')">&#9728; روشن</button>
+      </div>
+    </div>
+    <div class="set-row">
+      <div class="set-info">
+        <div class="st">نمای پیش‌فرض</div>
+        <div class="ss">حالت نمایش فایل‌ها هنگام باز شدن</div>
+      </div>
+      <div class="set-seg">
+        <button id="setListV" class="on" onclick="setPrefView('list')">&#9776; لیست</button>
+        <button id="setGridV" onclick="setPrefView('grid')">&#9638; گرید</button>
+      </div>
+    </div>
+    <div class="set-row">
+      <div class="set-info">
+        <div class="st">وضعیت سرور</div>
+        <div class="ss" id="setPath">{html.escape(display_path)}</div>
+      </div>
+      <span class="set-badge">Online</span>
+    </div>
+    <div class="set-row">
+      <div class="set-info">
+        <div class="st">مسیر فایل‌ها</div>
+        <div class="ss">downloads/ &mdash; فقط خواندنی در لینک‌ها؛ نوشتن از طریق مدیریت</div>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeSettings()">بستن</button>
+      <button class="btn ok" onclick="closeSettings();toast('Settings saved')">ذخیره</button>
+    </div>
+  </div>
+</div>
+
 <script>
 var BASE = {json.dumps(display_path)};
 var SELECTED = {first_file_json};
@@ -1800,6 +2700,17 @@ var TOTAL = {file_count};
   else document.getElementById("dName").textContent = "No file selected";
   var rows = document.querySelectorAll(".frow.file");
   if (rows.length) selectFile(rows[0]);
+  try {{
+    var v = localStorage.getItem("bs-view");
+    if (v === "grid" || v === "list") setView(v);
+  }} catch (e) {{}}
+  try {{
+    var th = localStorage.getItem("bs-theme");
+    if (th === "light" || th === "dark") {{
+      document.documentElement.setAttribute("data-theme", th);
+      updateThemeKnob();
+    }}
+  }} catch (e) {{}}
 }})();
 
 function applyMeta(m) {{
@@ -1859,6 +2770,7 @@ function setView(v) {{
   var bl = document.getElementById("btnList");
   if (v === "grid") {{ tb.classList.add("grid-view"); bg.classList.add("on"); bl.classList.remove("on"); }}
   else {{ tb.classList.remove("grid-view"); bl.classList.add("on"); bg.classList.remove("on"); }}
+  try {{ localStorage.setItem("bs-view", v); }} catch (e) {{}}
 }}
 
 function toggleSort(e) {{
@@ -1867,6 +2779,7 @@ function toggleSort(e) {{
 }}
 document.addEventListener("click", function() {{
   document.getElementById("sortMenu").classList.remove("open");
+  closeRowMenu();
 }});
 
 function sortRows(key, btn) {{
@@ -1875,29 +2788,40 @@ function sortRows(key, btn) {{
   }});
   btn.classList.add("on");
   var tb = document.getElementById("tbody");
+  var empty = tb.querySelector(".empty-state");
   var rows = Array.prototype.slice.call(tb.querySelectorAll(".frow"));
   rows.sort(function(a, b) {{
-    var ma = null, mb = null;
-    try {{ ma = JSON.parse(a.getAttribute("data-meta")); }} catch (e) {{}}
-    try {{ mb = JSON.parse(b.getAttribute("data-meta")); }} catch (e) {{}}
+    var ka = +(a.getAttribute("data-kind") || 2);
+    var kb = +(b.getAttribute("data-kind") || 2);
+    if (ka !== kb) return ka - kb;
     if (key === "name") {{
-      var na = (ma && ma.name) || a.textContent.trim();
-      var nb = (mb && mb.name) || b.textContent.trim();
-      return na.localeCompare(nb);
+      var na = a.getAttribute("data-name") || "";
+      var nb = b.getAttribute("data-name") || "";
+      try {{ return na.localeCompare(nb, undefined, {{numeric: true, sensitivity: "base"}}); }}
+      catch (e) {{ return na < nb ? -1 : na > nb ? 1 : 0; }}
     }}
     if (key === "size") {{
-      var sa = ma ? ma.sizeB : -1;
-      var sb = mb ? mb.sizeB : -1;
-      return sb - sa;
+      var sa = +(a.getAttribute("data-size") || -1);
+      var sb = +(b.getAttribute("data-size") || -1);
+      if (sa !== sb) return sb - sa;
+      var xa = a.getAttribute("data-name") || "";
+      var xb = b.getAttribute("data-name") || "";
+      try {{ return xa.localeCompare(xb, undefined, {{numeric: true, sensitivity: "base"}}); }}
+      catch (e) {{ return 0; }}
     }}
     if (key === "date") {{
-      var da = ma ? ma.mtime : "";
-      var db = mb ? mb.mtime : "";
-      return da < db ? 1 : da > db ? -1 : 0;
+      var da = +(a.getAttribute("data-mtime") || 0);
+      var db = +(b.getAttribute("data-mtime") || 0);
+      if (da !== db) return db - da;
+      var xa2 = a.getAttribute("data-name") || "";
+      var xb2 = b.getAttribute("data-name") || "";
+      try {{ return xa2.localeCompare(xb2, undefined, {{numeric: true, sensitivity: "base"}}); }}
+      catch (e) {{ return 0; }}
     }}
     return 0;
   }});
   rows.forEach(function(r) {{ tb.appendChild(r); }});
+  if (empty) tb.appendChild(empty);
 }}
 
 function currentHref() {{
@@ -1943,6 +2867,374 @@ function toast(msg) {{
   el.classList.add("show");
   clearTimeout(toastTimer);
   toastTimer = setTimeout(function() {{ el.classList.remove("show"); }}, 2400);
+}}
+
+/* ===== THEME DRAWER SWITCH ===== */
+(function initTheme() {{
+  var t = localStorage.getItem("bs-theme");
+  if (t !== "light" && t !== "dark") t = "dark";
+  document.documentElement.setAttribute("data-theme", t);
+  updateThemeKnob();
+}})();
+function toggleTheme() {{
+  var el = document.documentElement;
+  var cur = el.getAttribute("data-theme") === "light" ? "dark" : "light";
+  el.setAttribute("data-theme", cur);
+  localStorage.setItem("bs-theme", cur);
+  updateThemeKnob();
+}}
+function updateThemeKnob() {{
+  var t = document.documentElement.getAttribute("data-theme");
+  var k = document.getElementById("themeKnob");
+  if (k) k.innerHTML = t === "light" ? "&#9728;" : "&#127769;";
+}}
+
+/* ===== UPLOAD ===== */
+function uploadFiles(fileList) {{
+  if (!fileList || !fileList.length) return;
+  var fd = new FormData();
+  for (var i = 0; i < fileList.length; i++) fd.append("file", fileList[i]);
+  toast("Uploading " + fileList.length + " file(s)...");
+  fetch(location.pathname + "?__api=upload", {{ method: "POST", body: fd }})
+    .then(function(r) {{ return r.json().then(function(j) {{ return {{s: r.status, j: j}}; }}); }})
+    .then(function(res) {{
+      if (res.j && res.j.ok) {{
+        toast("Uploaded: " + res.j.files.join(", "));
+        setTimeout(function() {{ location.reload(); }}, 600);
+      }} else {{
+        toast((res.j && res.j.error) || "Upload failed");
+      }}
+      document.getElementById("fileInput").value = "";
+    }})
+    .catch(function() {{ toast("Upload failed"); document.getElementById("fileInput").value = ""; }});
+}}
+
+/* ===== NEW MODAL (جدید -> folder | file) ===== */
+var createKind = null; /* "folder" | "file" | null */
+
+function openNewModal() {{
+  document.getElementById("newModal").classList.add("open");
+  createKind = null;
+}}
+function closeNewModal() {{
+  document.getElementById("newModal").classList.remove("open");
+}}
+function openNameModal(kind) {{
+  createKind = kind;
+  closeNewModal();
+  var title = document.getElementById("nameTitle");
+  var sub = document.getElementById("nameSub");
+  var label = document.getElementById("nameLabel");
+  var input = document.getElementById("nameInput");
+  var hint = document.getElementById("nameHint");
+  var ok = document.getElementById("nameOk");
+  ok.disabled = false;
+  ok.innerHTML = "تایید";
+  input.value = "";
+  if (kind === "folder") {{
+    title.textContent = "پوشه جدید";
+    sub.innerHTML = "مسیر: <strong dir=\\"ltr\\">{html.escape(display_path)}</strong>";
+    label.textContent = "نام پوشه";
+    hint.textContent = "پوشه در مسیر فعلی ساخته می‌شود";
+  }} else {{
+    title.textContent = "فایل جدید";
+    sub.innerHTML = "مسیر: <strong dir=\\"ltr\\">{html.escape(display_path)}</strong>";
+    label.textContent = "نام فایل";
+    hint.textContent = "بدون پسوند → .txt اضافه می‌شود";
+  }}
+  document.getElementById("nameModal").classList.add("open");
+  setTimeout(function() {{ input.focus(); }}, 200);
+}}
+function closeNameModal() {{
+  document.getElementById("nameModal").classList.remove("open");
+  createKind = null;
+}}
+function nameInputChanged() {{
+  var v = document.getElementById("nameInput").value.trim();
+  var hint = document.getElementById("nameHint");
+  if (createKind === "file") {{
+    if (v && v.indexOf(".") < 0) hint.textContent = "ذخیره می‌شود با: " + v + ".txt";
+    else if (v) hint.textContent = "ذخیره می‌شود با: " + v;
+    else hint.textContent = "بدون پسوند → .txt اضافه می‌شود";
+  }} else {{
+    hint.textContent = v ? "پوشه: " + v : "پوشه در مسیر فعلی ساخته می‌شود";
+  }}
+}}
+function confirmName() {{
+  var input = document.getElementById("nameInput");
+  var name = input.value.trim();
+  if (!name) {{ toast("نام را وارد کنید"); input.focus(); return; }}
+  if (name.indexOf("/") >= 0 || name.indexOf("\\\\") >= 0 || name === "." || name === "..") {{
+    toast("نام نامعتبر است"); return;
+  }}
+  var api = createKind === "folder" ? "mkdir" : "create";
+  var ok = document.getElementById("nameOk");
+  ok.disabled = true;
+  ok.innerHTML = "در حال ساخت...<span class=\\"spinner\\"></span>";
+  fetch(location.pathname + "?__api=" + api, {{
+    method: "POST",
+    headers: {{ "Content-Type": "application/json" }},
+    body: JSON.stringify({{ name: name }})
+  }})
+    .then(function(r) {{ return r.json().then(function(j) {{ return {{s: r.status, j: j}}; }}); }})
+    .then(function(res) {{
+      if (res.j && res.j.ok) {{
+        toast((createKind === "folder" ? "پوشه ساخته شد: " : "فایل ساخته شد: ") + res.j.name);
+        closeNameModal();
+        setTimeout(function() {{ location.reload(); }}, 500);
+      }} else {{
+        toast((res.j && res.j.error) || "خطا");
+        ok.disabled = false;
+        ok.innerHTML = "تایید";
+      }}
+    }})
+    .catch(function() {{
+      toast("خطا در ارتباط با سرور");
+      ok.disabled = false;
+      ok.innerHTML = "تایید";
+    }});
+}}
+document.addEventListener("keydown", function(e) {{
+  if (e.key === "Escape") {{
+    closeNewModal(); closeNameModal();
+    closeDelModal(); closeRenModal(); closeDestModal(); closeSettings();
+    closeRowMenu();
+  }}
+}});
+
+/* ===== ROW CONTEXT MENU (three dots) ===== */
+var CTX = null; /* {{name, kind}} kind: 1=dir 2=file */
+var destMode = null; /* "move" | "copy" | null */
+var destPath = "/";
+
+function stopRowClick(e) {{
+  if (e) {{ e.preventDefault(); e.stopPropagation(); }}
+}}
+
+function openRowMenu(e, btn) {{
+  stopRowClick(e);
+  var row = btn.closest(".frow");
+  if (!row || row.classList.contains("parent-row")) return;
+  CTX = {{
+    name: row.getAttribute("data-name") || "",
+    kind: +(row.getAttribute("data-kind") || 2)
+  }};
+  if (row.classList.contains("file")) {{
+    try {{ selectFile(row); }} catch (err) {{}}
+  }}
+  var menu = document.getElementById("ctxMenu");
+  document.getElementById("ctxTitle").textContent = CTX.name;
+  document.querySelectorAll(".dots.open").forEach(function(d) {{ d.classList.remove("open"); }});
+  btn.classList.add("open");
+  menu.classList.add("open");
+  var r = btn.getBoundingClientRect();
+  var mw = menu.offsetWidth || 180;
+  var mh = menu.offsetHeight || 200;
+  var left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8));
+  var top = r.bottom + 6;
+  if (top + mh > window.innerHeight - 8) top = Math.max(8, r.top - mh - 6);
+  menu.style.left = left + "px";
+  menu.style.top = top + "px";
+  if (e) e.stopPropagation();
+}}
+
+function closeRowMenu() {{
+  var menu = document.getElementById("ctxMenu");
+  if (menu) menu.classList.remove("open");
+  document.querySelectorAll(".dots.open").forEach(function(d) {{ d.classList.remove("open"); }});
+}}
+
+function ctxAction(action) {{
+  if (!CTX) return;
+  closeRowMenu();
+  if (action === "delete") openDelModal();
+  else if (action === "rename") openRenModal();
+  else if (action === "move") openDestModal("move");
+  else if (action === "copy") openDestModal("copy");
+}}
+
+function postApi(api, body) {{
+  return fetch(location.pathname + "?__api=" + api, {{
+    method: "POST",
+    headers: {{ "Content-Type": "application/json" }},
+    body: JSON.stringify(body)
+  }}).then(function(r) {{
+    return r.json().then(function(j) {{ return {{s: r.status, j: j}}; }});
+  }});
+}}
+
+/* ---- delete ---- */
+function openDelModal() {{
+  if (!CTX) return;
+  document.getElementById("delName").textContent = CTX.name;
+  document.getElementById("delKind").textContent =
+    CTX.kind === 1 ? "Folder - removes all contents" : "File - permanent";
+  document.getElementById("delModal").classList.add("open");
+}}
+function closeDelModal() {{
+  document.getElementById("delModal").classList.remove("open");
+}}
+function confirmDelete() {{
+  if (!CTX) return;
+  var ok = document.getElementById("delOk");
+  ok.disabled = true;
+  ok.textContent = "...";
+  postApi("delete", {{ name: CTX.name }})
+    .then(function(res) {{
+      ok.disabled = false;
+      ok.textContent = "حذف";
+      if (res.j && res.j.ok) {{
+        toast("Deleted: " + CTX.name);
+        closeDelModal();
+        setTimeout(function() {{ location.reload(); }}, 500);
+      }} else toast((res.j && res.j.error) || "Delete failed");
+    }})
+    .catch(function() {{
+      ok.disabled = false;
+      ok.textContent = "حذف";
+      toast("Connection error");
+    }});
+}}
+
+/* ---- rename ---- */
+function openRenModal() {{
+  if (!CTX) return;
+  document.getElementById("renSub").textContent = CTX.name;
+  var input = document.getElementById("renInput");
+  input.value = CTX.name;
+  document.getElementById("renHint").textContent =
+    CTX.kind === 1 ? "Folder" : "Keep the extension for files";
+  document.getElementById("renModal").classList.add("open");
+  setTimeout(function() {{
+    input.focus();
+    var dot = CTX.name.lastIndexOf(".");
+    if (CTX.kind === 2 && dot > 0) input.setSelectionRange(0, dot);
+    else input.select();
+  }}, 200);
+}}
+function closeRenModal() {{
+  document.getElementById("renModal").classList.remove("open");
+}}
+function confirmRename() {{
+  if (!CTX) return;
+  var input = document.getElementById("renInput");
+  var nn = input.value.trim();
+  if (!nn) {{ toast("Enter a name"); input.focus(); return; }}
+  if (nn.indexOf("/") >= 0 || nn.indexOf("\\\\") >= 0 || nn === "." || nn === "..") {{
+    toast("Invalid name"); return;
+  }}
+  var ok = document.getElementById("renOk");
+  ok.disabled = true;
+  ok.innerHTML = "...<span class=\\"spinner\\"></span>";
+  postApi("rename", {{ name: CTX.name, newName: nn }})
+    .then(function(res) {{
+      ok.disabled = false;
+      ok.textContent = "تایید";
+      if (res.j && res.j.ok) {{
+        toast("Renamed to: " + res.j.name);
+        closeRenModal();
+        setTimeout(function() {{ location.reload(); }}, 500);
+      }} else toast((res.j && res.j.error) || "Rename failed");
+    }})
+    .catch(function() {{
+      ok.disabled = false;
+      ok.textContent = "تایید";
+      toast("Connection error");
+    }});
+}}
+
+/* ---- move / copy dest picker ---- */
+function openDestModal(mode) {{
+  if (!CTX) return;
+  destMode = mode;
+  destPath = "/";
+  document.getElementById("destTitle").textContent =
+    mode === "move" ? "انتقال به..." : "کپی به...";
+  document.getElementById("destSub").textContent = CTX.name;
+  document.getElementById("destHint").textContent = "مقصد: /";
+  var tree = document.getElementById("destTree");
+  tree.innerHTML = "<div style=\\"color:var(--text3);font-size:12px;padding:8px\\">Loading...</div>";
+  document.getElementById("destModal").classList.add("open");
+  fetch(location.pathname + "?__api=tree", {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: "{{}}" }})
+    .then(function(r) {{ return r.json(); }})
+    .then(function(j) {{
+      tree.innerHTML = "";
+      if (j && j.ok && j.tree) renderDestTree(j.tree, tree, 0);
+      else tree.innerHTML = "<div style=\\"color:var(--text3);font-size:12px;padding:8px\\">No folders</div>";
+    }})
+    .catch(function() {{
+      tree.innerHTML = "<div style=\\"color:var(--text3);font-size:12px;padding:8px\\">Error</div>";
+    }});
+}}
+function renderDestTree(node, el, depth) {{
+  var btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "dest-opt" + (node.path === destPath ? " on" : "");
+  btn.setAttribute("data-path", node.path);
+  btn.innerHTML = '<span class="di">&#128193;</span>' +
+    (depth ? '<span class="dest-indent"></span>'.repeat(depth) : "") +
+    "<span>" + (depth ? node.name : "downloads /") + "</span>";
+  btn.onclick = function() {{
+    destPath = node.path;
+    document.querySelectorAll(".dest-opt").forEach(function(o) {{ o.classList.remove("on"); }});
+    btn.classList.add("on");
+    document.getElementById("destHint").textContent = "مقصد: " + destPath;
+  }};
+  el.appendChild(btn);
+  (node.dirs || []).forEach(function(ch) {{ renderDestTree(ch, el, depth + 1); }});
+}}
+function closeDestModal() {{
+  document.getElementById("destModal").classList.remove("open");
+  destMode = null;
+}}
+function confirmDest() {{
+  if (!CTX || !destMode) return;
+  var ok = document.getElementById("destOk");
+  ok.disabled = true;
+  ok.innerHTML = "...<span class=\\"spinner\\"></span>";
+  postApi(destMode, {{ name: CTX.name, dest: destPath }})
+    .then(function(res) {{
+      ok.disabled = false;
+      ok.textContent = "تایید";
+      if (res.j && res.j.ok) {{
+        toast((destMode === "move" ? "Moved: " : "Copied: ") + CTX.name);
+        closeDestModal();
+        setTimeout(function() {{ location.reload(); }}, 500);
+      }} else toast((res.j && res.j.error) || "Failed");
+    }})
+    .catch(function() {{
+      ok.disabled = false;
+      ok.textContent = "تایید";
+      toast("Connection error");
+    }});
+}}
+
+/* ---- settings ---- */
+function openSettings() {{
+  syncSettingsUI();
+  document.getElementById("setModal").classList.add("open");
+}}
+function closeSettings() {{
+  document.getElementById("setModal").classList.remove("open");
+}}
+function syncSettingsUI() {{
+  var th = document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
+  document.getElementById("setDark").classList.toggle("on", th === "dark");
+  document.getElementById("setLight").classList.toggle("on", th === "light");
+  var v = "list";
+  try {{ v = localStorage.getItem("bs-view") || "list"; }} catch (e) {{}}
+  document.getElementById("setListV").classList.toggle("on", v !== "grid");
+  document.getElementById("setGridV").classList.toggle("on", v === "grid");
+}}
+function setTheme(t) {{
+  document.documentElement.setAttribute("data-theme", t);
+  try {{ localStorage.setItem("bs-theme", t); }} catch (e) {{}}
+  updateThemeKnob();
+  syncSettingsUI();
+}}
+function setPrefView(v) {{
+  setView(v);
+  syncSettingsUI();
 }}
 </script>
 </body>
