@@ -2387,6 +2387,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     --blue: #3b82f6;
     --blue2: #2563eb;
     --green: #22c55e;
+    --red: #ef4444;
     --purple: #8b5cf6;
     --pink: #ec4899;
     --teal: #14b8a6;
@@ -2423,6 +2424,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     --blue: #3b82f6;
     --blue2: #2563eb;
     --green: #16a34a;
+    --red: #dc2626;
     --purple: #8b5cf6;
     --pink: #ec4899;
     --teal: #14b8a6;
@@ -2740,7 +2742,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   /* ===== 3-COLUMN LAYOUT ===== */
   .layout {{
     display: grid;
-    grid-template-columns: 210px 1fr 300px;
+    grid-template-columns: var(--sidebar-w, 210px) 1fr 300px;
     /* One row that fills the flexed .app height and may shrink below content. */
     grid-template-rows: minmax(0, 1fr);
     flex: 1 1 auto;
@@ -2756,7 +2758,17 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     overflow-y: auto;
     min-height: 0;
     overscroll-behavior: contain;
+    position: relative;
   }}
+  .sidebar-resize {{
+    position: absolute; top: 0; right: -3px; width: 7px; height: 100%;
+    cursor: col-resize; z-index: 5; background: transparent;
+  }}
+  .sidebar-resize:hover, .sidebar-resize.active {{
+    background: linear-gradient(90deg, transparent, var(--blue) 60%);
+    opacity: .7;
+  }}
+  .sidebar-resize.active {{ opacity: 1; }}
   .tkids {{
     padding-left: 14px;
     margin-left: 7px;
@@ -3190,15 +3202,15 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   /* ---- grid view ---- */
   .tbody.grid-view {{
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-    gap: 10px; padding: 12px;
+    grid-template-columns: repeat(auto-fill, minmax(calc(140px * var(--list-zoom, 1)), 1fr));
+    gap: calc(10px * var(--list-zoom, 1)); padding: 12px;
     align-content: start;
   }}
   .tbody.grid-view .frow {{
     display: flex; flex-direction: column; text-align: center;
-    gap: 8px; padding: 18px 8px 14px;
+    gap: calc(8px * var(--list-zoom, 1)); padding: calc(18px * var(--list-zoom, 1)) 8px calc(14px * var(--list-zoom, 1));
     grid-template-columns: none;
-    min-height: 120px;
+    min-height: calc(120px * var(--list-zoom, 1));
     justify-content: center;
     position: relative;
   }}
@@ -3215,17 +3227,22 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   }}
   .tbody.grid-view .dots {{ opacity: 1; width: 28px; height: 28px; font-size: 16px; }}
   .tbody.grid-view .fname {{
-    flex-direction: column; gap: 8px; width: 100%;
+    flex-direction: column; gap: calc(8px * var(--list-zoom, 1)); width: 100%;
   }}
-  .tbody.grid-view .badge {{ width: 52px; height: 52px; border-radius: 14px; font-size: 14px; margin: 0 auto; }}
-  .tbody.grid-view .badge.folder {{ font-size: 28px; line-height: 1; }}
+  .tbody.grid-view .badge {{
+    width: calc(52px * var(--list-zoom, 1)); height: calc(52px * var(--list-zoom, 1));
+    border-radius: calc(14px * var(--list-zoom, 1));
+    font-size: calc(14px * var(--list-zoom, 1)); margin: 0 auto;
+  }}
+  .tbody.grid-view .badge.folder {{ font-size: calc(28px * var(--list-zoom, 1)); line-height: 1; }}
   .tbody.grid-view .ftext {{ align-items: center; width: 100%; }}
   .tbody.grid-view .flabel {{
     white-space: normal; word-break: break-word; line-height: 1.3;
     max-height: 2.6em; overflow: hidden;
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    font-size: calc(14px * var(--list-zoom, 1));
   }}
-  .tbody.grid-view .fsub {{ display: block; font-size: 10.5px; }}
+  .tbody.grid-view .fsub {{ display: block; font-size: calc(10.5px * var(--list-zoom, 1)); }}
   .tbody.grid-view .empty-state {{ grid-column: 1 / -1; }}
 
   /* ---- toast ---- */
@@ -3384,6 +3401,27 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   }}
   .modal .msub {{
     font-size: 12.5px; color: var(--text2); margin-bottom: 20px;
+  }}
+  /* upload progress */
+  .up-pct {{
+    font-size: 34px; font-weight: 800; color: var(--blue);
+    letter-spacing: -.02em; margin: 4px 0 2px; font-variant-numeric: tabular-nums;
+  }}
+  .up-bar {{
+    height: 10px; background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 999px; overflow: hidden; margin: 14px 0 8px;
+  }}
+  .up-bar > i {{
+    display: block; height: 100%; width: 0%;
+    background: linear-gradient(90deg, #4f8cff, #3b5bfc);
+    border-radius: 999px; transition: width .15s linear;
+  }}
+  .up-meta {{
+    font-size: 12.5px; color: var(--text2); word-break: break-all;
+    min-height: 1.3em; margin-bottom: 4px;
+  }}
+  .up-done {{
+    color: var(--green); font-weight: 700; font-size: 14px; margin-top: 6px;
   }}
   .choice-grid {{
     display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
@@ -3584,8 +3622,9 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
 
   <div class="layout">
     <!-- sidebar -->
-    <aside class="sidebar">
+    <aside class="sidebar" id="sidebar">
       {tree_html}
+      <div class="sidebar-resize" id="sidebarResize" title="Drag to resize"></div>
     </aside>
 
     <!-- center list -->
@@ -3777,6 +3816,22 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   </div>
 </div>
 
+<!-- glass modal: upload progress -->
+<div class="modal-back" id="upModal" onclick="if(event.target===this)cancelUpload()">
+  <div class="modal" role="dialog" aria-modal="true">
+    <h2 id="upTitle">آپلود فایل</h2>
+    <div class="msub" id="upSub">در حال انتقال به سرور…</div>
+    <div class="up-pct" id="upPct">0%</div>
+    <div class="up-bar"><i id="upBar"></i></div>
+    <div class="up-meta" id="upMeta"></div>
+    <div class="up-done" id="upDone" style="display:none">✓ آپلود شد</div>
+    <div class="modal-actions" id="upActions">
+      <button class="btn ghost" id="upCancelBtn" onclick="cancelUpload()">لغو</button>
+      <button class="btn ok" id="upCloseBtn" onclick="closeUploadModal()" style="display:none">بستن</button>
+    </div>
+  </div>
+</div>
+
 <!-- glass modal: settings -->
 <div class="modal-back" id="setModal" onclick="if(event.target===this)closeSettings()">
   <div class="modal" role="dialog" aria-modal="true">
@@ -3848,6 +3903,42 @@ document.addEventListener("wheel", function(e) {{
   e.preventDefault();
   zoomList(e.deltaY < 0 ? 1 : -1);
 }}, {{ passive: false }});
+
+/* ===== SIDEBAR RESIZE (desktop, like Windows Explorer) ===== */
+(function initSidebarResize() {{
+  var side = document.getElementById("sidebar");
+  var handle = document.getElementById("sidebarResize");
+  if (!side || !handle) return;
+  try {{
+    var w = parseInt(localStorage.getItem("bs-sidebar-w") || "", 10);
+    if (w >= 140 && w <= 520) document.documentElement.style.setProperty("--sidebar-w", w + "px");
+  }} catch (e) {{}}
+  var dragging = false;
+  function applyW(w) {{
+    w = Math.max(140, Math.min(520, Math.round(w)));
+    document.documentElement.style.setProperty("--sidebar-w", w + "px");
+    try {{ localStorage.setItem("bs-sidebar-w", String(w)); }} catch (e) {{}}
+  }}
+  handle.addEventListener("mousedown", function(e) {{
+    e.preventDefault();
+    dragging = true;
+    handle.classList.add("active");
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }});
+  document.addEventListener("mousemove", function(e) {{
+    if (!dragging) return;
+    var r = side.getBoundingClientRect();
+    applyW(e.clientX - r.left);
+  }});
+  document.addEventListener("mouseup", function() {{
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove("active");
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+  }});
+}})();
 
 (function init() {{
   if (SELECTED) applyMeta(SELECTED);
@@ -4560,23 +4651,97 @@ function updateThemeKnob() {{
 }}
 
 /* ===== UPLOAD ===== */
+var _upXhr = null;
+var _upDoneTimer = null;
+
+function openUploadModal(count, names) {{
+  var m = document.getElementById("upModal");
+  document.getElementById("upTitle").textContent = "آپلود فایل";
+  document.getElementById("upSub").textContent = count + " فایل — در حال انتقال به سرور…";
+  document.getElementById("upPct").textContent = "0%";
+  document.getElementById("upBar").style.width = "0%";
+  document.getElementById("upMeta").textContent = names.slice(0, 4).join("، ")
+    + (names.length > 4 ? " و " + (names.length - 4) + " مورد دیگر" : "");
+  document.getElementById("upDone").style.display = "none";
+  document.getElementById("upCancelBtn").style.display = "";
+  document.getElementById("upCloseBtn").style.display = "none";
+  m.classList.add("open");
+}}
+function closeUploadModal() {{
+  document.getElementById("upModal").classList.remove("open");
+  clearTimeout(_upDoneTimer);
+  _upXhr = null;
+}}
+function cancelUpload() {{
+  if (_upXhr) {{
+    try {{ _upXhr.abort(); }} catch (e) {{}}
+    _upXhr = null;
+  }}
+  closeUploadModal();
+  toast("Upload cancelled");
+  var fi = document.getElementById("fileInput");
+  if (fi) fi.value = "";
+}}
+function finishUpload(names) {{
+  var pct = document.getElementById("upPct");
+  var bar = document.getElementById("upBar");
+  var sub = document.getElementById("upSub");
+  var done = document.getElementById("upDone");
+  pct.textContent = "100%";
+  bar.style.width = "100%";
+  sub.textContent = "انتقال کامل شد";
+  done.style.display = "";
+  done.textContent = "✓ آپلود شد: " + names.join(", ");
+  document.getElementById("upCancelBtn").style.display = "none";
+  document.getElementById("upCloseBtn").style.display = "";
+  _upXhr = null;
+  toast("Uploaded: " + names.join(", "));
+  _upDoneTimer = setTimeout(function() {{
+    closeUploadModal();
+    setTimeout(function() {{ location.reload(); }}, 350);
+  }}, 1200);
+}}
+function failUpload(msg) {{
+  var sub = document.getElementById("upSub");
+  var done = document.getElementById("upDone");
+  sub.textContent = msg || "آپلود ناموفق بود";
+  done.style.display = "";
+  done.style.color = "var(--red)";
+  done.textContent = "✗ خطا";
+  document.getElementById("upCancelBtn").style.display = "none";
+  document.getElementById("upCloseBtn").style.display = "";
+  _upXhr = null;
+  toast(msg || "Upload failed");
+}}
 function uploadFiles(fileList) {{
   if (!fileList || !fileList.length) return;
+  var names = [];
+  for (var i = 0; i < fileList.length; i++) names.push(fileList[i].name);
   var fd = new FormData();
   for (var i = 0; i < fileList.length; i++) fd.append("file", fileList[i]);
-  toast("Uploading " + fileList.length + " file(s)...");
-  fetch(location.pathname + "?__api=upload", {{ method: "POST", body: fd }})
-    .then(function(r) {{ return r.json().then(function(j) {{ return {{s: r.status, j: j}}; }}); }})
-    .then(function(res) {{
-      if (res.j && res.j.ok) {{
-        toast("Uploaded: " + res.j.files.join(", "));
-        setTimeout(function() {{ location.reload(); }}, 600);
-      }} else {{
-        toast((res.j && res.j.error) || "Upload failed");
-      }}
-      document.getElementById("fileInput").value = "";
-    }})
-    .catch(function() {{ toast("Upload failed"); document.getElementById("fileInput").value = ""; }});
+  openUploadModal(fileList.length, names);
+  var xhr = new XMLHttpRequest();
+  _upXhr = xhr;
+  xhr.open("POST", location.pathname + "?__api=upload");
+  xhr.upload.onprogress = function(ev) {{
+    if (!ev.lengthComputable) return;
+    var p = Math.min(100, Math.round((ev.loaded / ev.total) * 100));
+    document.getElementById("upPct").textContent = p + "%";
+    document.getElementById("upBar").style.width = p + "%";
+  }};
+  xhr.onload = function() {{
+    var j = null;
+    try {{ j = JSON.parse(xhr.responseText); }} catch (e) {{}}
+    if (xhr.status >= 200 && xhr.status < 300 && j && j.ok) {{
+      finishUpload(j.files || names);
+    }} else {{
+      failUpload((j && j.error) || ("HTTP " + xhr.status));
+    }}
+    document.getElementById("fileInput").value = "";
+  }};
+  xhr.onerror = function() {{ failUpload("Network error"); document.getElementById("fileInput").value = ""; }};
+  xhr.onabort = function() {{ /* handled by cancelUpload */ }};
+  xhr.send(fd);
 }}
 
 /* ===== NEW MODAL (جدید -> folder | file) ===== */
@@ -4669,6 +4834,9 @@ document.addEventListener("keydown", function(e) {{
     closeNewModal(); closeNameModal();
     closeDelModal(); closeRenModal(); closeDestModal(); closeSettings();
     closeRowMenu();
+    if (_upXhr) cancelUpload();
+    else if (document.getElementById("upModal").classList.contains("open")
+             && document.getElementById("upCloseBtn").style.display !== "none") closeUploadModal();
     if (countChecked() > 0) unselectAll();
     return;
   }}
