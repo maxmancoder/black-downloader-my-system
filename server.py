@@ -2917,6 +2917,8 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     flex-shrink: 0;
     align-items: center;
   }}
+  /* grid view: hide the Name/Size/Last Modified header — info lives on the cards */
+  .center.grid-mode .thead {{ display: none; }}
   /* Independent scroll container for the file list.
      Wheel over this region scrolls only the list (native nested overflow);
      wheel outside scrolls the page as usual. */
@@ -3101,8 +3103,25 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     min-height: 0;
     overscroll-behavior: contain;
     display: flex; flex-direction: column; gap: 22px;
+    position: relative;
   }}
   .details > * {{ flex-shrink: 0; }}
+  /* empty state: blur the panel and show a centered hint */
+  .details-empty {{
+    display: none;
+    position: absolute; inset: 0; z-index: 3;
+    flex-direction: column; align-items: center; justify-content: center;
+    gap: 10px; padding: 24px 18px; text-align: center;
+    font-size: 14.5px; font-weight: 600; color: var(--text2);
+    background: color-mix(in srgb, var(--details-bg) 80%, transparent);
+  }}
+  .details-empty .de-ico {{ font-size: 34px; opacity: .55; }}
+  .details.empty {{ overflow: hidden; }}
+  .details.empty .details-empty {{ display: flex; }}
+  .details.empty > *:not(.details-empty) {{
+    filter: blur(7px); opacity: .55;
+    pointer-events: none; user-select: none; -webkit-user-select: none;
+  }}
   .detail-top {{
     display: flex; flex-direction: column; align-items: center;
     text-align: center; gap: 6px;
@@ -3218,8 +3237,15 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     justify-content: center;
     position: relative;
   }}
-  .tbody.grid-view .fcell.fsize,
+  .tbody.grid-view .fcell.fsize {{ display: none; }}
   .tbody.grid-view .fcell.fmtime {{ display: none; }}
+  @media (min-width: 981px) {{
+    .tbody.grid-view .fcell.fmtime {{
+      display: block; width: 100%; text-align: center;
+      font-size: calc(11px * var(--list-zoom, 1)); color: var(--text3);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }}
+  }}
   .tbody.grid-view .fcell.fchk {{
     position: absolute; top: 6px; left: 6px;
     width: auto; z-index: 2;
@@ -3667,6 +3693,10 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
 
     <!-- right details -->
     <aside class="details">
+      <div class="details-empty" id="detailsEmpty">
+        <div class="de-ico">&#128196;</div>
+        <div class="de-txt" dir="rtl">فایلی را انتخاب کنید</div>
+      </div>
       <div class="detail-top">
         <div class="detail-icon file" id="dIcon">&#128196;</div>
         <div class="detail-name" id="dName">No file selected</div>
@@ -3945,9 +3975,17 @@ document.addEventListener("wheel", function(e) {{
   }});
 }})();
 
+function setDetailsEmpty(on) {{
+  var d = document.querySelector(".details");
+  if (!d) return;
+  if (on) {{ try {{ d.scrollTop = 0; }} catch (e) {{}} }}
+  d.classList.toggle("empty", !!on);
+}}
+
 (function init() {{
   if (SELECTED) applyMeta(SELECTED);
   else document.getElementById("dName").textContent = "No file selected";
+  setDetailsEmpty(countChecked() === 0);
   try {{
     var v = localStorage.getItem("bs-view");
     if (v === "grid" || v === "list") setView(v);
@@ -4188,6 +4226,7 @@ function updateSelectionUI() {{
     if (sub1) sub1.textContent = "Select a file";
     if (sub2) sub2.textContent = "Compress and download";
   }}
+  setDetailsEmpty(n === 0);
 }}
 
 var IMG_EXT = {{png:1,jpg:1,jpeg:1,gif:1,webp:1,svg:1,ico:1,bmp:1,avif:1}};
@@ -4379,6 +4418,7 @@ function restoreLocalRows() {{
   if (_localRowsHTML !== null) {{
     tb.innerHTML = _localRowsHTML;
     _localRowsHTML = null;
+    updateSelectionUI();
   }}
 }}
 
@@ -4386,6 +4426,7 @@ function runServerSearch(q) {{
   var tb = document.getElementById("tbody");
   if (_localRowsHTML === null) _localRowsHTML = tb.innerHTML;
   tb.innerHTML = '<div class="empty-state"><div class="empty-icon">\\u2315</div><div>Searching entire server...</div></div>';
+  updateSelectionUI();
   fetch(location.pathname + "?__api=search", {{
     method: "POST",
     headers: {{ "Content-Type": "application/json" }},
@@ -4393,10 +4434,11 @@ function runServerSearch(q) {{
   }})
     .then(function(r) {{ return r.json(); }})
     .then(function(j) {{
-      if (!j || !j.ok) {{ tb.innerHTML = '<div class="empty-state"><div>Search failed</div></div>'; return; }}
+      if (!j || !j.ok) {{ tb.innerHTML = '<div class="empty-state"><div>Search failed</div></div>'; updateSelectionUI(); return; }}
       var res = j.results || [];
       if (!res.length) {{
         tb.innerHTML = '<div class="empty-state"><div class="empty-icon">\\u2315</div><div>No matches on server for "' + escapeHtml(q) + '"</div></div>';
+        updateSelectionUI();
         return;
       }}
       tb.innerHTML = res.map(function(it) {{
@@ -4448,9 +4490,11 @@ function runServerSearch(q) {{
           '<div class="fcell fmtime"></div>' +
           '<div class="fcell fdot"></div></div>';
       }}).join("");
+      updateSelectionUI();
     }})
     .catch(function() {{
       tb.innerHTML = '<div class="empty-state"><div>Connection error during search</div></div>';
+      updateSelectionUI();
     }});
 }}
 
@@ -4462,8 +4506,10 @@ function setView(v) {{
   var tb = document.getElementById("tbody");
   var bg = document.getElementById("btnGrid");
   var bl = document.getElementById("btnList");
+  var ctr = document.querySelector(".center");
   if (v === "grid") {{ tb.classList.add("grid-view"); bg.classList.add("on"); bl.classList.remove("on"); }}
   else {{ tb.classList.remove("grid-view"); bl.classList.add("on"); bg.classList.remove("on"); }}
+  if (ctr) ctr.classList.toggle("grid-mode", v === "grid");
   try {{ localStorage.setItem("bs-view", v); }} catch (e) {{}}
 }}
 
