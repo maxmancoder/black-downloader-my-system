@@ -2748,6 +2748,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     flex: 1 1 auto;
     min-height: 0;
     overflow: hidden;
+    position: relative;
   }}
 
   /* ---- sidebar tree ---- */
@@ -2760,9 +2761,12 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     overscroll-behavior: contain;
     position: relative;
   }}
+  /* Handle lives on .layout (not inside the scrolling .sidebar) so it stays put. */
   .sidebar-resize {{
-    position: absolute; top: 0; right: -3px; width: 7px; height: 100%;
-    cursor: col-resize; z-index: 5; background: transparent;
+    position: absolute; top: 0; bottom: 0;
+    left: calc(var(--sidebar-w, 210px) - 3px);
+    width: 7px;
+    cursor: col-resize; z-index: 6; background: transparent;
   }}
   .sidebar-resize:hover, .sidebar-resize.active {{
     background: linear-gradient(90deg, transparent, var(--blue) 60%);
@@ -3504,6 +3508,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     .app {{ flex: none; }}
     .layout {{ grid-template-columns: 1fr; grid-template-rows: none; overflow: visible; }}
     .sidebar {{ display: none; }}
+    .sidebar-resize {{ display: none; }}
     .center {{
       border-right: none;
       height: calc(100dvh - 110px);
@@ -3624,8 +3629,8 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     <!-- sidebar -->
     <aside class="sidebar" id="sidebar">
       {tree_html}
-      <div class="sidebar-resize" id="sidebarResize" title="Drag to resize"></div>
     </aside>
+    <div class="sidebar-resize" id="sidebarResize" title="Drag to resize"></div>
 
     <!-- center list -->
     <section class="center">
