@@ -2,7 +2,7 @@
 
 یک سرور دانلود فایل عمومی برای ویندوز — بدون نیاز به هیچ تنظیم شبکه، پورت فوروارد، یا آدرس IP ثابت.
 فایل `start_server.bat` را دابل‌کلیک کنید تا پوشه `downloads` شما به یک لینک عمومی تبدیل شود.
-
+اگر کاربر ایرانی هستید، حتما فیلترشکن روشن کنید!
 A public file download server for Windows — no port forwarding, no public IP,
 no router configuration needed. Double-click `start_server.bat` and your
 `downloads` folder becomes a public download link.
