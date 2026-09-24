@@ -73,7 +73,8 @@ LOCK_FILE: Path = LOGS_DIR / "server.lock"
 HOST: str = "127.0.0.1"          # bind to localhost only, never 0.0.0.0
 DEFAULT_PORT: int = 8080
 PORT_SCAN_LIMIT: int = 20        # how many ports to try after the default one
-CHUNK_SIZE: int = 64 * 1024      # streaming chunk size (keeps RAM usage flat)
+CHUNK_SIZE: int = 256 * 1024     # streaming chunk size (keeps RAM usage flat)
+UPLOAD_CHUNK: int = 512 * 1024   # larger reads while receiving uploads
 
 # Background job store for long-running move/copy (avoids Cloudflare tunnel timeouts).
 _JOBS: dict = {}
@@ -921,6 +922,8 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
 
     server_version = "BlackServer/1.0"
     protocol_version = "HTTP/1.1"
+    # Buffered writes are much faster than one syscall per header/body slice.
+    wbufsize = 65536
 
     # -- logging ----------------------------------------------------------
     def _client_ip(self) -> str:
@@ -998,7 +1001,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             return b""
         return self.rfile.read(length)
 
-    def _read_body_stream(self, on_chunk) -> int:
+    def _read_body_stream(self, on_chunk, chunk_size: int = CHUNK_SIZE) -> int:
         """Read request body in chunks, calling ``on_chunk(bytes)``. Returns total bytes."""
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -1009,7 +1012,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
         remaining = length
         total = 0
         while remaining > 0:
-            chunk = self.rfile.read(min(CHUNK_SIZE, remaining))
+            chunk = self.rfile.read(min(chunk_size, remaining))
             if not chunk:
                 break
             remaining -= len(chunk)
@@ -1271,7 +1274,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             state["buf"] += chunk
             process_buf(final=False)
 
-        self._read_body_stream(on_chunk)
+        self._read_body_stream(on_chunk, chunk_size=UPLOAD_CHUNK)
         process_buf(final=True)
         _close_current()
 
@@ -1657,6 +1660,10 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
 
     # -- request handling -------------------------------------------------
     def send_head(self):
+        raw_path = urllib.parse.urlparse(self.path).path
+        if raw_path in ("/favicon.ico", "/favicon.png"):
+            return self._send_favicon()
+
         path = self._resolve_path()
         if path is None or not path.exists() or self._is_hidden(path):
             self.send_error(HTTPStatus.NOT_FOUND, "File not found")
@@ -1692,8 +1699,97 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
         if query.get("edit"):
             return self._render_editor(path)
         if query.get("inline"):
+            ext = path.suffix.lower()
+            img_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".avif"}
+            if ext in img_exts:
+                return self._render_image_viewer(path)
             return self._send_file(path, inline=True)
         return self._send_file(path)
+
+    def _render_image_viewer(self, path: Path):
+        """Serve an image viewer page with a top download button."""
+        try:
+            st = path.stat()
+        except OSError:
+            self.send_error(HTTPStatus.NOT_FOUND, "File not found")
+            return None
+        name = html.escape(path.name)
+        size = human_size(st.st_size)
+        # relative download URL (same path, no query -> attachment)
+        page = (
+            "<!DOCTYPE html>\n"
+            '<html lang="en" data-theme="dark">\n'
+            "<head>\n"
+            '<meta charset="utf-8">\n'
+            "<script>try{var t=localStorage.getItem('bs-theme');"
+            "if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>\n"
+            '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+            '<link rel="icon" href="/favicon.ico" sizes="any">\n'
+            f"<title>Black File Manager - Black Server</title>\n"
+            "<style>\n"
+            ":root{--bg:#0b0f17;--panel:#111827;--border:#273244;--text:#e5e7eb;--text2:#9ca3af;--blue:#3b82f6;}\n"
+            "html[data-theme=light]{--bg:#f3f4f6;--panel:#ffffff;--border:#d1d5db;--text:#111827;--text2:#6b7280;}\n"
+            "*{box-sizing:border-box;margin:0;padding:0;}\n"
+            "body{background:var(--bg);color:var(--text);font-family:Segoe UI,system-ui,sans-serif;"
+            "height:100vh;display:flex;flex-direction:column;overflow:hidden;}\n"
+            ".ihead{display:flex;align-items:center;gap:12px;padding:10px 16px;"
+            "background:var(--panel);border-bottom:1px solid var(--border);flex-shrink:0;}\n"
+            ".iname{font-weight:700;font-size:14px;overflow:hidden;text-overflow:ellipsis;"
+            "white-space:nowrap;flex:1;min-width:0;}\n"
+            ".isize{color:var(--text2);font-size:12px;white-space:nowrap;}\n"
+            ".ibtn{border:1px solid var(--border);background:var(--panel);color:var(--text);"
+            "padding:8px 16px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;"
+            "text-decoration:none;display:inline-flex;align-items:center;gap:8px;transition:filter .12s;}\n"
+            ".ibtn.primary{background:linear-gradient(135deg,#4f8cff,#3b5bfc);border-color:transparent;color:#fff;}\n"
+            ".ibtn:hover{filter:brightness(1.1);}\n"
+            ".istage{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;"
+            "padding:16px;overflow:auto;"
+            "background:repeating-conic-gradient(#151a22 0% 25%, #0f131a 0% 50%) 50%/24px 24px;}\n"
+            "html[data-theme=light] .istage{background:repeating-conic-gradient(#e5e7eb 0% 25%, #f9fafb 0% 50%) 50%/24px 24px;}\n"
+            ".istage img{max-width:100%;max-height:100%;object-fit:contain;border-radius:8px;"
+            "box-shadow:0 8px 32px rgba(0,0,0,.45);}\n"
+            "</style>\n"
+            "</head>\n"
+            "<body>\n"
+            '<div class="ihead">\n'
+            f'<span class="iname">{name}</span>\n'
+            f'<span class="isize">{size}</span>\n'
+            '<button class="ibtn" type="button" onclick="closeViewerTab()">Back</button>\n'
+            '<a class="ibtn primary" id="dlBtn" download>'
+            "&#8681; Download</a>\n"
+            "</div>\n"
+            '<div class="istage">\n'
+            f'<img alt="{name}" src="{html.escape(urllib.parse.quote(path.name))}">\n'
+            "</div>\n"
+            "<script>\n"
+            "function closeViewerTab(){\n"
+            "  try{window.close();}catch(e){}\n"
+            "  setTimeout(function(){\n"
+            "    try{ if(!window.closed) history.back(); }catch(e2){\n"
+            "      location.href=location.pathname.replace(/[^/]*$/,'')||'/';\n"
+            "    }\n"
+            "  },80);\n"
+            "}\n"
+            "(function(){\n"
+            "  var a=document.getElementById('dlBtn');\n"
+            "  a.href=location.pathname;\n"
+            "  a.setAttribute('download'," + json.dumps(path.name) + ");\n"
+            "})();\n"
+            "</script>\n"
+            "</body>\n"
+            "</html>\n"
+        )
+        data = page.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        accept_enc = (self.headers.get("Accept-Encoding") or "").lower()
+        if "gzip" in accept_enc:
+            data = gzip.compress(data, compresslevel=5)
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        return io.BytesIO(data)
 
     def _send_zip_items(self, directory: Path, names: list):
         """Stream a ZIP of selected items inside *directory*."""
@@ -1745,6 +1841,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "File too large to edit")
             return None
         name = html.escape(path.name)
+        raw_name = path.name
         esc_text = html.escape(text)
         theme = "dark"
         page = (
@@ -1755,7 +1852,8 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             "<script>try{var t=localStorage.getItem('bs-theme');"
             "if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>\n"
             '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
-            f"<title>Editor - {name} - Black Server</title>\n"
+            '<link rel="icon" href="/favicon.ico" sizes="any">\n'
+            f"<title>Black File Manager - Black Server</title>\n"
             "<style>\n"
             ":root{--bg:#0b0f17;--panel:#111827;--panel2:#1f2937;--border:#273244;"
             "--text:#e5e7eb;--text2:#9ca3af;--blue:#3b82f6;--green:#22c55e;--red:#ef4444;}\n"
@@ -1779,6 +1877,8 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             ".estat{font-size:12px;color:var(--text2);min-width:60px;text-align:left;}\n"
             ".estat.ok{color:var(--green);}\n"
             ".estat.err{color:var(--red);}\n"
+            ".ename[contenteditable=true]{outline:1px solid var(--blue);border-radius:6px;"
+            "padding:2px 6px;background:var(--panel2);cursor:text;}\n"
             "#editor{flex:1;min-height:0;width:100%;border:none;outline:none;resize:none;"
             "background:var(--bg);color:var(--text);font-family:Consolas,Menlo,monospace;"
             "font-size:13.5px;line-height:1.55;padding:16px 18px;tab-size:4;white-space:pre;"
@@ -1788,17 +1888,88 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             "</head>\n"
             "<body>\n"
             '<div class="ehead">\n'
-            f'<span class="ename">{name}</span>\n'
+            f'<span class="ename" id="ename" title="Double-click to rename" '
+            f'ondblclick="startRename()">{name}</span>\n'
             f'<span class="esize">{human_size(size)}</span>\n'
             '<span class="estat" id="estat"></span>\n'
-            '<button class="ebtn" type="button" onclick="history.back()">Back</button>\n'
+            '<button class="ebtn" type="button" onclick="startRename()">Rename</button>\n'
+            '<button class="ebtn" type="button" onclick="closeEditorTab()">Back</button>\n'
             '<button class="ebtn primary" type="button" id="saveBtn" onclick="saveFile()">Save</button>\n'
             "</div>\n"
             '<textarea id="editor" spellcheck="false" autocomplete="off" '
             'autocorrect="off" autocapitalize="off">'
             f"{esc_text}</textarea>\n"
             "<script>\n"
-            "var FILENAME=" + json.dumps(name) + ";\n"
+            "var FILENAME=" + json.dumps(raw_name) + ";\n"
+            "var RENAMING=false;\n"
+            "function closeEditorTab(){\n"
+            "  try{window.close();}catch(e){}\n"
+            "  setTimeout(function(){\n"
+            "    try{ if(!window.closed) history.back(); }catch(e2){\n"
+            "      location.href=location.pathname.replace(/[^/]*$/,'')||'/';\n"
+            "    }\n"
+            "  },80);\n"
+            "}\n"
+            "function startRename(){\n"
+            "  if(RENAMING)return;\n"
+            "  RENAMING=true;\n"
+            "  var el=document.getElementById('ename');\n"
+            "  el.contentEditable='true';\n"
+            "  el.focus();\n"
+            "  var r=document.createRange(); r.selectNodeContents(el);\n"
+            "  var s=getSelection(); s.removeAllRanges(); s.addRange(r);\n"
+            "  var st=document.getElementById('estat');\n"
+            "  st.textContent='Enter to confirm'; st.className='estat';\n"
+            "  if(!el._renBound){\n"
+            "    el._renBound=true;\n"
+            "    el.addEventListener('keydown',function(ev){\n"
+            "      if(!RENAMING)return;\n"
+            "      if(ev.key==='Enter'){ev.preventDefault();commitRename();}\n"
+            "      if(ev.key==='Escape'){ev.preventDefault();cancelRename();}\n"
+            "    });\n"
+            "    el.addEventListener('blur',function(){ setTimeout(function(){ if(RENAMING) commitRename(); },120); });\n"
+            "  }\n"
+            "}\n"
+            "function cancelRename(){\n"
+            "  var el=document.getElementById('ename');\n"
+            "  el.contentEditable='false';\n"
+            "  el.textContent=FILENAME;\n"
+            "  RENAMING=false;\n"
+            "  var st=document.getElementById('estat'); st.textContent=''; st.className='estat';\n"
+            "}\n"
+            "function commitRename(){\n"
+            "  if(!RENAMING)return;\n"
+            "  var el=document.getElementById('ename');\n"
+            "  var nn=(el.textContent||'').trim();\n"
+            "  el.contentEditable='false';\n"
+            "  RENAMING=false;\n"
+            "  var st=document.getElementById('estat');\n"
+            "  if(!nn||nn===FILENAME){ el.textContent=FILENAME; st.textContent=''; return; }\n"
+            "  if(nn.indexOf('/')>=0||nn.indexOf('\\\\')>=0||nn==='.'||nn==='..'){\n"
+            "    el.textContent=FILENAME; st.textContent='Invalid name'; st.className='estat err'; return;\n"
+            "  }\n"
+            "  st.textContent='Renaming...'; st.className='estat';\n"
+            "  fetch(location.pathname+'?__api=rename',{\n"
+            "    method:'POST',headers:{'Content-Type':'application/json'},\n"
+            "    body:JSON.stringify({name:FILENAME,newName:nn})\n"
+            "  }).then(function(r){return r.json().then(function(j){return {s:r.status,j:j};});})\n"
+            "  .then(function(res){\n"
+            "    if(res.j&&res.j.ok){\n"
+            "      FILENAME=res.j.name||nn;\n"
+            "      el.textContent=FILENAME;\n"
+            "      document.title='Black File Manager - Black Server';\n"
+            "      var dir=location.pathname.replace(/[^/]*$/,'');\n"
+            "      history.replaceState(null,'',dir+encodeURIComponent(FILENAME)+'?edit=1');\n"
+            "      st.textContent='Renamed'; st.className='estat ok';\n"
+            "    }else{\n"
+            "      el.textContent=FILENAME;\n"
+            "      st.textContent=(res.j&&res.j.error)||'Rename failed'; st.className='estat err';\n"
+            "    }\n"
+            "  }).catch(function(){\n"
+            "    el.textContent=FILENAME;\n"
+            "    st.textContent='Network error'; st.className='estat err';\n"
+            "  });\n"
+            "}\n"
             "function saveFile(){\n"
             "  var btn=document.getElementById('saveBtn');\n"
             "  var st=document.getElementById('estat');\n"
@@ -1812,9 +1983,9 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             "  .then(function(res){\n"
             "    btn.disabled=false; btn.textContent='Save';\n"
             "    if(res.j&&res.j.ok){\n"
-            "      st.textContent='Saved'; st.className='estat ok';\n"
+            "      st.textContent='Saved — closing in 3s'; st.className='estat ok';\n"
             "      btn.classList.add('saved');\n"
-            "      setTimeout(function(){btn.classList.remove('saved');st.textContent='';st.className='estat';},2000);\n"
+            "      setTimeout(function(){ try{window.close();}catch(e){} },3000);\n"
             "    }else{\n"
             "      st.textContent=(res.j&&res.j.error)||'Save failed'; st.className='estat err';\n"
             "    }\n"
@@ -1826,6 +1997,10 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             "document.getElementById('editor').addEventListener('keydown',function(e){\n"
             "  if((e.ctrlKey||e.metaKey)&&e.key==='s'){e.preventDefault();saveFile();}\n"
             "});\n"
+            "window.addEventListener('popstate',function(){ try{window.close();}catch(e){} });\n"
+            "document.addEventListener('keydown',function(e){\n"
+            "  if(e.key==='F2'){e.preventDefault();startRename();}\n"
+            "});\n"
             "</script>\n"
             "</body>\n"
             "</html>\n"
@@ -1833,8 +2008,12 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
         data = page.encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-cache")
+        accept_enc = (self.headers.get("Accept-Encoding") or "").lower()
+        if "gzip" in accept_enc:
+            data = gzip.compress(data, compresslevel=5)
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         return io.BytesIO(data)
 
@@ -1859,6 +2038,21 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             return
         logger.info("Saved %s (%d bytes)", path, len(data))
         self._json_response(HTTPStatus.OK, {"ok": True, "name": path.name, "size": len(data)})
+
+    def _send_favicon(self):
+        """Serve the project favicon (``favicon.ico`` next to ``server.py``)."""
+        ico = PROJECT_ROOT / "favicon.ico"
+        try:
+            data = ico.read_bytes()
+        except OSError:
+            self.send_error(HTTPStatus.NOT_FOUND, "No favicon")
+            return None
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "image/x-icon")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        return io.BytesIO(data)
 
     def _send_zip(self, path: Path):
         """Stream *path* (file or folder) as a ZIP archive."""
@@ -2075,8 +2269,15 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
                 rows.append(
                     f'<div class="frow dir" data-href="{href}" data-name="{label}" '
                     f'data-kind="1" data-size="{dir_bytes}" data-mtime="{int(mtime)}" '
+                    f'draggable="true" '
                     f'onclick="onRowClick(event, this)" '
                     f'ondblclick="onRowDblClick(event, this)" '
+                    f'oncontextmenu="onRowContextMenu(event, this)" '
+                    f'ondragstart="onDragStart(event, this)" '
+                    f'ondragend="onDragEnd(event)" '
+                    f'ondragover="onDragOver(event, this)" '
+                    f'ondragleave="onDragLeave(event, this)" '
+                    f'ondrop="onDropRow(event, this)" '
                     f'onmouseenter="hoverRow(this)" onmouseleave="unhoverRow(this)">'
                     f'<div class="fcell fchk" onclick="event.stopPropagation()">'
                     f'<input type="checkbox" class="chk" onchange="onCheckChange(this)">'
@@ -2118,8 +2319,15 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
                     f'<div class="frow file" data-meta="{html.escape(meta, quote=True)}" '
                     f'data-name="{label}" data-kind="2" data-size="{size_b}" '
                     f'data-mtime="{int(mtime)}" '
+                    f'draggable="true" '
                     f'onclick="onRowClick(event, this)" '
                     f'ondblclick="onRowDblClick(event, this)" '
+                    f'oncontextmenu="onRowContextMenu(event, this)" '
+                    f'ondragstart="onDragStart(event, this)" '
+                    f'ondragend="onDragEnd(event)" '
+                    f'ondragover="onDragOver(event, this)" '
+                    f'ondragleave="onDragLeave(event, this)" '
+                    f'ondrop="onDropRow(event, this)" '
                     f'onmouseenter="hoverRow(this)" onmouseleave="unhoverRow(this)">'
                     f'<div class="fcell fchk" onclick="event.stopPropagation()">'
                     f'<input type="checkbox" class="chk" onchange="onCheckChange(this)">'
@@ -2152,9 +2360,18 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
 <script>try{{var t=localStorage.getItem("bs-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}}catch(e){{}}</script>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>File Manager - Black Server</title>
+<title>Black File Manager - Black Server</title>
+<link rel="icon" href="/favicon.ico" sizes="any">
 <style>
   *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  html {{
+    user-select: none;
+    -webkit-user-select: none;
+  }}
+  input, textarea, select, [contenteditable], .flabel, .search input {{
+    user-select: text;
+    -webkit-user-select: text;
+  }}
 
   :root, [data-theme="dark"] {{
     --bg: #070b14;
@@ -2540,9 +2757,26 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     min-height: 0;
     overscroll-behavior: contain;
   }}
-  .tkids {{ padding-left: 4px; }}
+  .tkids {{
+    padding-left: 14px;
+    margin-left: 7px;
+    border-left: 1.5px solid var(--border2);
+    position: relative;
+  }}
   .tnode > .tkids {{ display: none; }}
   .tnode.open > .tkids {{ display: block; }}
+  .tnode.open:not(.current) > .trow {{ opacity: .96; }}
+  .tnode.open > .tkids > .tnode {{
+    border-left: none;
+  }}
+  .tnode:has(> .tkids) > .trow {{
+    border: 1px solid transparent;
+    border-radius: 8px;
+  }}
+  .tnode.open:has(> .tkids) > .trow {{
+    border-color: color-mix(in srgb, var(--blue) 28%, transparent);
+    background: color-mix(in srgb, var(--blue) 6%, transparent);
+  }}
   .trow {{
     display: flex; align-items: center; gap: 2px;
     min-width: 0;
@@ -2602,6 +2836,22 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     border-bottom: 1px solid var(--border);
     flex-shrink: 0;
   }}
+  .zoom-tools {{
+    display: flex; align-items: center; background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 9px;
+    overflow: hidden;
+  }}
+  .zoom-tools button {{
+    width: 32px; height: 32px; border: none; background: transparent;
+    color: var(--text3); cursor: pointer; font-size: 15px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    transition: all .15s;
+  }}
+  .zoom-tools button:hover {{ background: var(--panel3); color: var(--blue); }}
+  .zoom-tools .zval {{
+    min-width: 44px; text-align: center; font-size: 11px; font-weight: 700;
+    color: var(--text2); user-select: none;
+  }}
   .view-toggle {{
     display: flex; background: var(--panel2);
     border: 1px solid var(--border); border-radius: 9px;
@@ -2644,9 +2894,9 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   .thead {{
     display: grid;
     grid-template-columns: 28px 1fr 90px 150px 40px;
-    gap: 8px; padding: 10px 16px;
+    gap: 8px; padding: calc(10px * var(--list-zoom, 1)) 16px;
     border-bottom: 1px solid var(--border);
-    font-size: 11.5px; font-weight: 700; letter-spacing: .04em;
+    font-size: calc(11.5px * var(--list-zoom, 1)); font-weight: 700; letter-spacing: .04em;
     color: var(--text3); text-transform: uppercase;
     flex-shrink: 0;
     align-items: center;
@@ -2666,7 +2916,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     display: grid;
     grid-template-columns: 28px 1fr 90px 150px 40px;
     gap: 8px; align-items: center;
-    padding: 10px 10px; border-radius: 11px;
+    padding: calc(10px * var(--list-zoom, 1)) 10px; border-radius: 11px;
     cursor: pointer; border: 1.5px solid transparent;
     transition: background .15s, border-color .15s, transform .15s;
     animation: rowIn .35s cubic-bezier(.16,1,.3,1) both;
@@ -2686,26 +2936,83 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     position: relative; z-index: 1;
   }}
   .fchk .chk {{
-    width: 15px; height: 15px; margin: 0;
-    accent-color: var(--blue); cursor: pointer;
+    appearance: none; -webkit-appearance: none;
+    width: 17px; height: 17px; margin: 0;
+    border: 1.5px solid var(--border2);
+    border-radius: 5px;
+    background: var(--panel2);
+    cursor: pointer;
     flex-shrink: 0;
+    position: relative;
+    transition: background .12s, border-color .12s, box-shadow .12s, transform .1s;
+    box-shadow: 0 1px 2px rgba(0,0,0,.15);
+  }}
+  .fchk .chk:hover {{
+    border-color: var(--blue);
+    box-shadow: 0 0 0 3px rgba(59,130,246,.18);
+  }}
+  .fchk .chk:checked {{
+    background: linear-gradient(135deg, #4f8cff, #3b5bfc);
+    border-color: transparent;
+    box-shadow: 0 2px 8px rgba(59,130,246,.4);
+  }}
+  .fchk .chk:checked::after {{
+    content: "";
+    position: absolute;
+    left: 4.5px; top: 1px;
+    width: 5px; height: 9px;
+    border: solid #fff;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+  }}
+  .fchk .chk:active {{ transform: scale(.92); }}
+  .frow.selected .fchk .chk {{
+    border-color: var(--blue);
   }}
   .parent-row .fchk {{ visibility: hidden; }}
-  .thead .fchk input {{ width: 15px; height: 15px; margin: 0; accent-color: var(--blue); cursor: pointer; }}
+  .thead .fchk input {{
+    appearance: none; -webkit-appearance: none;
+    width: 17px; height: 17px; margin: 0;
+    border: 1.5px solid var(--border2);
+    border-radius: 5px;
+    background: var(--panel2);
+    cursor: pointer;
+    position: relative;
+    transition: background .12s, border-color .12s, box-shadow .12s;
+    box-shadow: 0 1px 2px rgba(0,0,0,.15);
+  }}
+  .thead .fchk input:hover {{
+    border-color: var(--blue);
+    box-shadow: 0 0 0 3px rgba(59,130,246,.18);
+  }}
+  .thead .fchk input:checked {{
+    background: linear-gradient(135deg, #4f8cff, #3b5bfc);
+    border-color: transparent;
+    box-shadow: 0 2px 8px rgba(59,130,246,.4);
+  }}
+  .thead .fchk input:checked::after {{
+    content: "";
+    position: absolute;
+    left: 4.5px; top: 1px;
+    width: 5px; height: 9px;
+    border: solid #fff;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+  }}
   .frow .fname {{
     display: flex; align-items: center; gap: 12px; min-width: 0;
   }}
   .ftext {{ min-width: 0; display: flex; flex-direction: column; gap: 2px; }}
   .flabel {{
-    font-size: 14px; font-weight: 600;
+    font-size: calc(14px * var(--list-zoom, 1)); font-weight: 600;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }}
   .fsub {{
-    font-size: 11.5px; color: var(--text3);
+    font-size: calc(11.5px * var(--list-zoom, 1)); color: var(--text3);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }}
   .fsize, .fmtime {{
-    font-size: 12.5px; color: var(--text2);
+    font-size: calc(12.5px * var(--list-zoom, 1)); color: var(--text2);
     font-variant-numeric: tabular-nums;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }}
@@ -2718,19 +3025,31 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     display: inline-flex; align-items: center; justify-content: center;
     padding: 0; line-height: 1;
   }}
+  /* Desktop: hide three dots — use right-click instead */
+  @media (min-width: 981px) {{
+    .dots {{ display: none !important; }}
+    .frow, .thead .fchk, .tbody {{ user-select: none; -webkit-user-select: none; }}
+  }}
   .frow:hover .dots, .dots.open {{ opacity: 1; }}
   .dots:hover {{ color: var(--text); background: var(--panel3); }}
   .parent-row .dots {{ display: none; }}
+  .frow.drag-over {{
+    outline: 2px dashed var(--blue);
+    outline-offset: -2px;
+    background: var(--sel);
+  }}
+  .frow.dragging {{ opacity: .45; }}
 
   /* file type badges */
   .badge {{
-    width: 38px; height: 38px; flex-shrink: 0;
+    width: calc(38px * var(--list-zoom, 1)); height: calc(38px * var(--list-zoom, 1));
+    flex-shrink: 0;
     border-radius: 10px;
     display: flex; align-items: center; justify-content: center;
-    font-size: 11px; font-weight: 800; letter-spacing: -.02em;
+    font-size: calc(11px * var(--list-zoom, 1)); font-weight: 800; letter-spacing: -.02em;
     color: #fff;
   }}
-  .badge.html {{ background: linear-gradient(135deg,#f97316,#ea580c); font-size: 12px; }}
+  .badge.html {{ background: linear-gradient(135deg,#f97316,#ea580c); font-size: calc(12px * var(--list-zoom, 1)); }}
   .badge.css  {{ background: linear-gradient(135deg,#38bdf8,#0284c7); }}
   .badge.js   {{ background: linear-gradient(135deg,#facc15,#eab308); color: #1a1a1a; }}
   .badge.ts   {{ background: linear-gradient(135deg,#60a5fa,#2563eb); }}
@@ -2825,6 +3144,14 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   .dl-btn:hover {{ transform: translateY(-2px); filter: brightness(1.08); }}
   .dl-btn:hover::after {{ opacity: 1; }}
   .dl-btn:active {{ transform: translateY(0); }}
+  .dl-btn.disabled, .dl-btn:disabled {{
+    opacity: .4;
+    cursor: not-allowed;
+    filter: grayscale(.6);
+    pointer-events: none;
+    transform: none !important;
+    box-shadow: none !important;
+  }}
   .dl-btn.blue {{
     background: linear-gradient(135deg, #60a5fa 0%, #3b82f6 55%, #2563eb 100%);
     box-shadow: 0 6px 20px rgba(59,130,246,.4);
@@ -3147,6 +3474,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
       overflow: hidden;
     }}
     .list-tools {{ padding: 8px 12px; }}
+    .zoom-tools {{ display: none; }}
     .thead {{ padding: 7px 12px; }}
     .frow {{ padding: 6px 8px; }}
     .badge {{ width: 30px; height: 30px; font-size: 10px; }}
@@ -3160,6 +3488,8 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     .metrics {{ display: none; }}
     .thead, .frow {{ grid-template-columns: 28px 1fr 80px 40px; }}
     .thead .h-mtime, .frow .fmtime {{ display: none; }}
+    .dots {{ opacity: 1; }}
+    .tbody.grid-view .dots {{ opacity: 1; }}
   }}
   @media (max-width: 600px) {{
     body {{ padding: 8px; }}
@@ -3261,6 +3591,11 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     <!-- center list -->
     <section class="center">
       <div class="list-tools">
+        <div class="zoom-tools" title="List size (Ctrl+scroll also works)">
+          <button type="button" id="zoomOutBtn" onclick="zoomList(-1)" aria-label="Smaller list">&minus;</button>
+          <span class="zval" id="zoomVal">100%</span>
+          <button type="button" id="zoomInBtn" onclick="zoomList(1)" aria-label="Larger list">+</button>
+        </div>
         <div class="view-toggle">
           <button id="btnGrid" title="Grid view" onclick="setView('grid')">&#9638;</button>
           <button id="btnList" class="on" title="List view" onclick="setView('list')">&#9776;</button>
@@ -3494,6 +3829,26 @@ var BASE = {json.dumps(display_path)};
 var SELECTED = {first_file_json};
 var TOTAL = {file_count};
 
+var LIST_ZOOM = 1;
+function setListZoom(z) {{
+  z = Math.max(0.6, Math.min(2, Math.round(z * 100) / 100));
+  LIST_ZOOM = z;
+  document.documentElement.style.setProperty("--list-zoom", String(z));
+  var el = document.getElementById("zoomVal");
+  if (el) el.textContent = Math.round(z * 100) + "%";
+  try {{ localStorage.setItem("bs-zoom", String(z)); }} catch (e) {{}}
+}}
+function zoomList(dir) {{
+  setListZoom(LIST_ZOOM + dir * 0.1);
+}}
+document.addEventListener("wheel", function(e) {{
+  if (!(e.ctrlKey || e.metaKey)) return;
+  var tb = e.target && e.target.closest ? e.target.closest(".tbody, .center, .list-tools") : null;
+  if (!tb) return;
+  e.preventDefault();
+  zoomList(e.deltaY < 0 ? 1 : -1);
+}}, {{ passive: false }});
+
 (function init() {{
   if (SELECTED) applyMeta(SELECTED);
   else document.getElementById("dName").textContent = "No file selected";
@@ -3507,6 +3862,10 @@ var TOTAL = {file_count};
       var sb = document.querySelector('.sort-menu button[data-k="' + sk + '"]');
       if (sb) sortRows(sk, sb);
     }}
+  }} catch (e) {{}}
+  try {{
+    var z = parseFloat(localStorage.getItem("bs-zoom"));
+    if (z >= 0.6 && z <= 2) setListZoom(z);
   }} catch (e) {{}}
 }})();
 
@@ -3547,14 +3906,66 @@ function isMobile() {{
   return window.matchMedia("(max-width: 980px)").matches;
 }}
 
+var LAST_ANCHOR = null;
+
 function onRowClick(e, row) {{
   if (e && e.target && e.target.closest && e.target.closest(".fchk")) return;
   if (row.classList.contains("parent-row")) {{ goParent(); return; }}
-  if (isMobile() && row.classList.contains("dir")) {{
+  if (isMobile() && row.classList.contains("dir") && !(e && (e.ctrlKey || e.metaKey || e.shiftKey))) {{
     goDir(row.getAttribute("data-href"));
     return;
   }}
+  if (e && e.shiftKey && LAST_ANCHOR) {{
+    selectRange(LAST_ANCHOR, row);
+    return;
+  }}
+  if (e && (e.ctrlKey || e.metaKey)) {{
+    toggleRow(row);
+    LAST_ANCHOR = row;
+    return;
+  }}
   selectOnly(row);
+  LAST_ANCHOR = row;
+}}
+
+function selectRange(fromRow, toRow) {{
+  var rows = Array.prototype.slice.call(document.querySelectorAll("#tbody .frow"))
+    .filter(function(r) {{ return !r.classList.contains("parent-row"); }});
+  var i = rows.indexOf(fromRow);
+  var j = rows.indexOf(toRow);
+  if (i < 0 || j < 0) {{ selectOnly(toRow); LAST_ANCHOR = toRow; return; }}
+  var a = Math.min(i, j), b = Math.max(i, j);
+  clearChecks();
+  for (var k = a; k <= b; k++) {{
+    var r = rows[k];
+    var cb = r.querySelector(".chk");
+    if (cb) cb.checked = true;
+    r.classList.add("selected");
+  }}
+  updateSelectionUI();
+  if (toRow.classList.contains("file")) {{
+    try {{ applyMeta(JSON.parse(toRow.getAttribute("data-meta"))); }} catch (err) {{}}
+  }}
+}}
+
+function toggleRow(row) {{
+  var cb = row.querySelector(".chk");
+  if (!cb) return;
+  cb.checked = !cb.checked;
+  if (cb.checked) row.classList.add("selected");
+  else {{ row.classList.remove("selected"); row.style.background = ""; }}
+  updateSelectionUI();
+  if (cb.checked && row.classList.contains("file")) {{
+    try {{ applyMeta(JSON.parse(row.getAttribute("data-meta"))); }} catch (err) {{}}
+  }}
+}}
+
+function unselectAll() {{
+  clearChecks();
+  LAST_ANCHOR = null;
+  updateSelectionUI();
+  var dName = document.getElementById("dName");
+  if (dName) dName.textContent = "No file selected";
 }}
 
 function onRowDblClick(e, row) {{
@@ -3638,10 +4049,16 @@ function updateSelectionUI() {{
   var sub2 = document.getElementById("dlSub2");
   var dName = document.getElementById("dName");
   var dIcon = document.getElementById("dIcon");
+  var btnDownload = document.getElementById("btnDownload");
   if (n > 1) {{
+    if (btnDownload) {{
+      btnDownload.disabled = true;
+      btnDownload.classList.add("disabled");
+      btnDownload.setAttribute("aria-disabled", "true");
+    }}
     if (dName) dName.textContent = n + " items selected";
     if (dIcon) {{ dIcon.className = "detail-icon file"; dIcon.innerHTML = "&#128193;"; }}
-    if (sub1) sub1.textContent = "Download " + n + " items as ZIP";
+    if (sub1) sub1.textContent = "Disabled for multi-select";
     if (sub2) sub2.textContent = "ZIP " + n + " items";
     var dSize = document.getElementById("dSize");
     var dType = document.getElementById("dType");
@@ -3652,6 +4069,11 @@ function updateSelectionUI() {{
     if (dMod) dMod.textContent = "—";
     if (dPerm) dPerm.textContent = "—";
   }} else if (n === 1) {{
+    if (btnDownload) {{
+      btnDownload.disabled = false;
+      btnDownload.classList.remove("disabled");
+      btnDownload.removeAttribute("aria-disabled");
+    }}
     var row = getCheckedRows()[0];
     if (row && row.classList.contains("file")) {{
       try {{ applyMeta(JSON.parse(row.getAttribute("data-meta"))); }} catch (e) {{}}
@@ -3661,6 +4083,11 @@ function updateSelectionUI() {{
       if (sub2) sub2.textContent = "Compress and download";
     }}
   }} else {{
+    if (btnDownload) {{
+      btnDownload.disabled = false;
+      btnDownload.classList.remove("disabled");
+      btnDownload.removeAttribute("aria-disabled");
+    }}
     if (dName) dName.textContent = "No file selected";
     if (sub1) sub1.textContent = "Select a file";
     if (sub2) sub2.textContent = "Compress and download";
@@ -3703,6 +4130,84 @@ function toggleTNode(e, btn) {{
   var node = btn.closest(".tnode");
   if (node) node.classList.toggle("open");
 }}
+
+/* ===== DRAG & DROP ===== */
+var _dragNames = [];
+var _dragFrom = null;
+
+function onDragStart(e, row) {{
+  if (row.classList.contains("parent-row")) {{ e.preventDefault(); return; }}
+  if (!row.classList.contains("selected")) {{
+    selectOnly(row);
+    LAST_ANCHOR = row;
+  }}
+  _dragNames = getCheckedNames();
+  _dragFrom = location.pathname;
+  if (e.dataTransfer) {{
+    e.dataTransfer.effectAllowed = "move";
+    try {{ e.dataTransfer.setData("text/plain", _dragNames.join("\\n")); }} catch (err) {{}}
+  }}
+  row.classList.add("dragging");
+}}
+
+function onDragEnd(e) {{
+  document.querySelectorAll(".frow.dragging").forEach(function(r) {{ r.classList.remove("dragging"); }});
+  document.querySelectorAll(".frow.drag-over").forEach(function(r) {{ r.classList.remove("drag-over"); }});
+  _dragNames = [];
+  _dragFrom = null;
+}}
+
+function onDragOver(e, row) {{
+  if (!row.classList.contains("dir") || row.classList.contains("parent-row")) return;
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+  row.classList.add("drag-over");
+}}
+
+function onDragLeave(e, row) {{
+  row.classList.remove("drag-over");
+}}
+
+function onDropRow(e, row) {{
+  e.preventDefault();
+  e.stopPropagation();
+  row.classList.remove("drag-over");
+  if (!row.classList.contains("dir") || row.classList.contains("parent-row")) return;
+  var names = _dragNames.length ? _dragNames : getCheckedNames();
+  if (!names.length) return;
+  var destHref = row.getAttribute("data-href") || "";
+  if (!destHref) return;
+  /* cannot drop into itself */
+  var destName = row.getAttribute("data-name") || "";
+  names = names.filter(function(n) {{ return n !== destName; }});
+  if (!names.length) {{ toast("Cannot drop into itself"); return; }}
+  var destPath = destHref.charAt(0) === "/" ? destHref : (location.pathname.replace(/[^/]*$/, "") + destHref);
+  moveItems(names, destPath);
+}}
+
+function moveItems(names, destPath) {{
+  var p = Promise.resolve();
+  var failed = 0;
+  names.forEach(function(n) {{
+    p = p.then(function() {{
+      return postApi("move", {{ name: n, dest: destPath }}).then(function(res) {{
+        if (!(res && res.j && res.j.ok)) failed++;
+      }}).catch(function() {{ failed++; }});
+    }});
+  }});
+  p.then(function() {{
+    if (failed) toast("Moved with " + failed + " error(s)");
+    else toast("Moved " + names.length + " item(s) to " + destPath);
+    setTimeout(function() {{ location.reload(); }}, 500);
+  }});
+}}
+
+/* click empty area of list -> unselect */
+document.addEventListener("click", function(e) {{
+  var tb = document.getElementById("tbody");
+  if (tb && e.target === tb) unselectAll();
+  else if (tb && e.target.classList && e.target.classList.contains("empty-state")) unselectAll();
+}});
 
 function filterRows() {{
   var q = document.getElementById("searchInput").value.trim().toLowerCase();
@@ -3803,9 +4308,15 @@ function runServerSearch(q) {{
         var sub = isDir ? "Folder" : "File";
         if (isDir) {{
           return '<div class="frow dir" data-href="' + it.href + '" data-name="' + escapeHtml(it.name) + '" ' +
-            'data-kind="1" data-size="-1" data-mtime="0" ' +
+            'data-kind="1" data-size="-1" data-mtime="0" draggable="true" ' +
             'onclick="onRowClick(event, this)" ' +
             'ondblclick="onRowDblClick(event, this)" ' +
+            'oncontextmenu="onRowContextMenu(event, this)" ' +
+            'ondragstart="onDragStart(event, this)" ' +
+            'ondragend="onDragEnd(event)" ' +
+            'ondragover="onDragOver(event, this)" ' +
+            'ondragleave="onDragLeave(event, this)" ' +
+            'ondrop="onDropRow(event, this)" ' +
             'onmouseenter="hoverRow(this)" onmouseleave="unhoverRow(this)">' +
             '<div class="fcell fchk" onclick="event.stopPropagation()">' +
             '<input type="checkbox" class="chk" onchange="onCheckChange(this)"></div>' +
@@ -3822,9 +4333,15 @@ function runServerSearch(q) {{
           path: it.path, ext: (it.name.split(".").pop() || "file").toLowerCase()
         }});
         return '<div class="frow file" data-meta="' + escapeHtml(fmeta) + '" data-href="' + it.href + '" data-name="' + escapeHtml(it.name) + '" ' +
-          'data-kind="2" data-size="0" data-mtime="0" ' +
+          'data-kind="2" data-size="0" data-mtime="0" draggable="true" ' +
           'onclick="onRowClick(event, this)" ' +
           'ondblclick="onRowDblClick(event, this)" ' +
+          'oncontextmenu="onRowContextMenu(event, this)" ' +
+          'ondragstart="onDragStart(event, this)" ' +
+          'ondragend="onDragEnd(event)" ' +
+          'ondragover="onDragOver(event, this)" ' +
+          'ondragleave="onDragLeave(event, this)" ' +
+          'ondrop="onDropRow(event, this)" ' +
           'onmouseenter="hoverRow(this)" onmouseleave="unhoverRow(this)">' +
           '<div class="fcell fchk" onclick="event.stopPropagation()">' +
           '<input type="checkbox" class="chk" onchange="onCheckChange(this)"></div>' +
@@ -3951,11 +4468,51 @@ function actZip() {{
   window.location.href = SELECTED.href + "?zip=1";
 }}
 function actShare() {{
+  var checked = getCheckedRows();
+  if (checked.length > 1) {{
+    var names = checked.map(function(r) {{ return r.getAttribute("data-name") || ""; }});
+    var url = location.origin + location.pathname + "?" + names.map(function(n) {{
+      return "items=" + encodeURIComponent(n);
+    }}).join("&");
+    copyText(url, "Share link copied for " + checked.length + " items!");
+    return;
+  }}
+  if (checked.length === 1) {{
+    var row = checked[0];
+    var h = row.getAttribute("data-href") || "";
+    try {{ var m = JSON.parse(row.getAttribute("data-meta")); if (m.href) h = m.href; }} catch (e) {{}}
+    if (h) {{
+      var u1 = location.origin + (BASE || "/").replace(/\\/$/, "") + "/" + h.replace(/^\\//, "");
+      if (h.charAt(0) === "/") u1 = location.origin + h;
+      copyText(u1, "Share link copied!");
+      return;
+    }}
+  }}
   if (!SELECTED) {{ toast("Select a file first"); return; }}
   var url = location.origin + BASE.replace(/\\/$/, "") + "/" + SELECTED.href;
   copyText(url, "Share link copied!");
 }}
 function actCopy() {{
+  var checked = getCheckedRows();
+  if (checked.length > 1) {{
+    var names = checked.map(function(r) {{ return r.getAttribute("data-name") || ""; }});
+    var url = location.origin + location.pathname + "?" + names.map(function(n) {{
+      return "items=" + encodeURIComponent(n);
+    }}).join("&");
+    copyText(url, "Direct link copied for " + checked.length + " items!");
+    return;
+  }}
+  if (checked.length === 1) {{
+    var row = checked[0];
+    var h = row.getAttribute("data-href") || "";
+    try {{ var m = JSON.parse(row.getAttribute("data-meta")); if (m.href) h = m.href; }} catch (e) {{}}
+    if (h) {{
+      var u1 = h.charAt(0) === "/" ? (location.origin + h)
+        : (location.origin + (BASE || "/").replace(/\\/$/, "") + "/" + h.replace(/^\\//, ""));
+      copyText(u1, "Direct link copied!");
+      return;
+    }}
+  }}
   if (!SELECTED) {{ toast("Select a file first"); return; }}
   var url = location.origin + BASE.replace(/\\/$/, "") + "/" + SELECTED.href;
   copyText(url, "Direct link copied!");
@@ -4112,10 +4669,33 @@ document.addEventListener("keydown", function(e) {{
     closeNewModal(); closeNameModal();
     closeDelModal(); closeRenModal(); closeDestModal(); closeSettings();
     closeRowMenu();
+    if (countChecked() > 0) unselectAll();
+    return;
+  }}
+  if (e.key === "F2") {{
+    var rows = getCheckedRows();
+    if (rows.length === 1) {{
+      e.preventDefault();
+      CTX = {{
+        name: rows[0].getAttribute("data-name") || "",
+        kind: +(rows[0].getAttribute("data-kind") || 2),
+        multi: false,
+        names: [rows[0].getAttribute("data-name") || ""]
+      }};
+      openRenModal();
+    }}
+    return;
+  }}
+  if (e.key === "a" && (e.ctrlKey || e.metaKey)) {{
+    var tag = (e.target && e.target.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    e.preventDefault();
+    document.getElementById("chkAll").checked = true;
+    toggleAllChecks(document.getElementById("chkAll"));
   }}
 }});
 
-/* ===== ROW CONTEXT MENU (three dots) ===== */
+/* ===== ROW CONTEXT MENU (three dots + right-click) ===== */
 var CTX = null; /* {{name, kind, multi, names}} kind: 1=dir 2=file */
 var destMode = null; /* "move" | "copy" | null */
 var destPath = "/";
@@ -4124,9 +4704,19 @@ function stopRowClick(e) {{
   if (e) {{ e.preventDefault(); e.stopPropagation(); }}
 }}
 
-function openRowMenu(e, btn) {{
-  stopRowClick(e);
-  var row = btn.closest(".frow");
+function onRowContextMenu(e, row) {{
+  if (!e) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (!row || row.classList.contains("parent-row")) return;
+  if (!row.classList.contains("selected")) {{
+    selectOnly(row);
+    LAST_ANCHOR = row;
+  }}
+  showRowMenuAt(e.clientX, e.clientY, row);
+}}
+
+function showRowMenuAt(x, y, row) {{
   if (!row || row.classList.contains("parent-row")) return;
   var multi = countChecked() > 1 && row.classList.contains("selected");
   var names = multi ? getCheckedNames() : [row.getAttribute("data-name") || ""];
@@ -4136,11 +4726,35 @@ function openRowMenu(e, btn) {{
     multi: multi,
     names: names
   }};
-  if (row.classList.contains("file") && !multi) {{
-    try {{ selectOnly(row); }} catch (err) {{}}
-  }} else if (!multi && !row.classList.contains("parent-row")) {{
-    try {{ selectOnly(row); }} catch (err) {{}}
+  var menu = document.getElementById("ctxMenu");
+  document.getElementById("ctxTitle").textContent =
+    multi ? (names.length + " items") : CTX.name;
+  document.querySelectorAll(".dots.open").forEach(function(d) {{ d.classList.remove("open"); }});
+  menu.classList.add("open");
+  var mw = menu.offsetWidth || 180;
+  var mh = menu.offsetHeight || 200;
+  var left = Math.max(8, Math.min(x, window.innerWidth - mw - 8));
+  var top = Math.max(8, Math.min(y, window.innerHeight - mh - 8));
+  menu.style.left = left + "px";
+  menu.style.top = top + "px";
+}}
+
+function openRowMenu(e, btn) {{
+  stopRowClick(e);
+  var row = btn.closest(".frow");
+  if (!row || row.classList.contains("parent-row")) return;
+  if (!row.classList.contains("selected")) {{
+    selectOnly(row);
+    LAST_ANCHOR = row;
   }}
+  var multi = countChecked() > 1 && row.classList.contains("selected");
+  var names = multi ? getCheckedNames() : [row.getAttribute("data-name") || ""];
+  CTX = {{
+    name: row.getAttribute("data-name") || "",
+    kind: +(row.getAttribute("data-kind") || 2),
+    multi: multi,
+    names: names
+  }};
   var menu = document.getElementById("ctxMenu");
   document.getElementById("ctxTitle").textContent =
     multi ? (names.length + " items") : CTX.name;
@@ -4150,9 +4764,15 @@ function openRowMenu(e, btn) {{
   var r = btn.getBoundingClientRect();
   var mw = menu.offsetWidth || 180;
   var mh = menu.offsetHeight || 200;
-  var left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8));
-  var top = r.bottom + 6;
-  if (top + mh > window.innerHeight - 8) top = Math.max(8, r.top - mh - 6);
+  var left, top;
+  if (isMobile()) {{
+    left = Math.max(8, Math.min(r.left, window.innerWidth - mw - 8));
+    top = Math.max(8, Math.min(r.top, window.innerHeight - mh - 8));
+  }} else {{
+    left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8));
+    top = r.bottom + 6;
+    if (top + mh > window.innerHeight - 8) top = Math.max(8, r.top - mh - 6);
+  }}
   menu.style.left = left + "px";
   menu.style.top = top + "px";
   if (e) e.stopPropagation();
