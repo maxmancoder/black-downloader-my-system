@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import gzip
 import html
 import io
 import json
@@ -48,6 +49,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 import webbrowser
 import zipfile
 from http import HTTPStatus
@@ -72,6 +74,12 @@ HOST: str = "127.0.0.1"          # bind to localhost only, never 0.0.0.0
 DEFAULT_PORT: int = 8080
 PORT_SCAN_LIMIT: int = 20        # how many ports to try after the default one
 CHUNK_SIZE: int = 64 * 1024      # streaming chunk size (keeps RAM usage flat)
+
+# Background job store for long-running move/copy (avoids Cloudflare tunnel timeouts).
+_JOBS: dict = {}
+_JOBS_LOCK = threading.Lock()
+_SIDEBAR_CACHE: dict = {"html": None, "ts": 0.0, "for": None}
+_SIDEBAR_TTL = 4.0
 
 # Official, always-latest Cloudflare release asset for 64-bit Windows.
 CLOUDFLARED_DOWNLOAD_URL: str = (
@@ -186,6 +194,36 @@ def human_size(num_bytes: int) -> str:
             return f"{size:.1f} {unit}"
         size /= 1024
     return f"{size:.1f} TB"
+
+
+def _folder_stats(folder: Path, *, max_depth: int = 6, max_files: int = 20000):
+    """Return (file_count, total_bytes) for files under *folder* (recursive)."""
+    count = 0
+    total = 0
+    stack: list[tuple[Path, int]] = [(folder, 0)]
+    while stack and count < max_files:
+        current_dir, depth = stack.pop()
+        if depth > max_depth:
+            continue
+        try:
+            with os.scandir(current_dir) as it:
+                for entry in it:
+                    if entry.name.startswith("."):
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if depth < max_depth:
+                                stack.append((Path(entry.path), depth + 1))
+                        elif entry.is_file(follow_symlinks=False):
+                            count += 1
+                            total += entry.stat(follow_symlinks=False).st_size
+                            if count >= max_files:
+                                break
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return count, total
 
 
 def is_process_running(pid: int) -> bool:
@@ -645,11 +683,16 @@ def wait_reachable(url: str, tries: int = SSH_REACH_TRIES,
     """Best-effort check that the public URL actually reaches the local server.
 
     Reverse tunnels over SSH can take a few seconds before the first request
-    is forwarded; ``delay`` lets the tunnel settle between attempts.
+    is forwarded; ``delay`` lets the tunnel settle between attempts.  Quick
+    Tunnel DNS can also lag, so Cloudflare URLs may need a few retries too.
     """
-    for _ in range(tries):
+    for _ in range(max(1, tries)):
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (BlackServerHealthCheck)"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
                 if resp.status == HTTPStatus.OK:
                     return True
         except Exception:  # noqa: BLE001 - any failure just means "try again"
@@ -677,10 +720,13 @@ def try_ssh_fallback(port: int, timeout: float = SSH_STARTUP_TIMEOUT,
         public_url = ssh.wait_for_url(timeout)
         if public_url:
             print(f"    [OK] {name} gave URL: {public_url}")
-            return ssh, public_url
-
-        # No URL — try next provider.
-        print(f"    [!] {name} did not give a URL in {int(timeout)}s.")
+            print("    [..] Verifying the public URL reaches this server ...")
+            if wait_reachable(public_url, tries=SSH_REACH_TRIES, delay=SSH_REACH_DELAY):
+                print("    [OK] Public URL is live.")
+                return ssh, public_url
+            print(f"    [!] {name} URL did not respond; trying next provider ...")
+        else:
+            print(f"    [!] {name} did not give a URL in {int(timeout)}s.")
         ssh.stop()
 
     print("[ERROR] All SSH tunnel providers failed.")
@@ -787,10 +833,17 @@ def _perm_string(path: Path) -> str:
 
 
 def _sidebar_tree(current: Path) -> str:
-    """Build the nested folder tree for the left sidebar."""
+    """Build the nested folder tree for the left sidebar (cached, no repeated resolve)."""
     root = DOWNLOADS_DIR.resolve()
+    try:
+        cur = str(current.resolve())
+    except OSError:
+        cur = str(current)
+    now = time.time()
+    if _SIDEBAR_CACHE["html"] is not None and now - _SIDEBAR_CACHE["ts"] < _SIDEBAR_TTL and _SIDEBAR_CACHE["for"] == cur:
+        return _SIDEBAR_CACHE["html"]
 
-    def walk(directory: Path) -> str:
+    def walk(directory: Path, dir_abs: str) -> str:
         try:
             subdirs = sorted(
                 (
@@ -804,31 +857,51 @@ def _sidebar_tree(current: Path) -> str:
         parts = []
         for sd in subdirs:
             href = "/" + sd.relative_to(root).as_posix() + "/"
-            is_self = sd.resolve() == current.resolve()
-            under = str(current.resolve()).startswith(
-                str(sd.resolve()) + os.sep
-            ) or is_self
+            sd_abs = str(sd)
+            is_self = sd_abs == cur
+            under = cur.startswith(sd_abs + os.sep) or is_self
             cls = " active" if is_self else ""
             open_cls = " open" if under else ""
-            children = walk(sd)
+            current_cls = " current" if is_self else ""
+            children = walk(sd, sd_abs)
+            has_kids = bool(children)
+            if has_kids:
+                chev = (
+                    '<button type="button" class="tchev" aria-label="Toggle" '
+                    'onclick="toggleTNode(event, this)">&#9654;</button>'
+                )
+            else:
+                chev = '<span class="tchev empty"></span>'
             parts.append(
-                f'<div class="tnode{open_cls}">'
+                f'<div class="tnode{open_cls}{current_cls}">'
+                f'<div class="trow">{chev}'
                 f'<a class="tlink{cls}" href="{html.escape(href)}">'
                 f'<span class="tfolder"></span>'
-                f'<span class="tname">{html.escape(sd.name)}</span></a>'
+                f'<span class="tname">{html.escape(sd.name)}</span></a></div>'
                 f"{children}</div>"
             )
         return f'<div class="tkids">{"".join(parts)}</div>' if parts else ""
 
-    root_active = " active" if current.resolve() == root else ""
-    children = walk(root)
-    return (
-        '<div class="tnode open">'
+    root_abs = str(root)
+    root_active = " active" if cur == root_abs else ""
+    root_current = " current" if cur == root_abs else ""
+    children = walk(root, root_abs)
+    root_chev = (
+        '<button type="button" class="tchev" aria-label="Toggle" '
+        'onclick="toggleTNode(event, this)">&#9654;</button>'
+        if children
+        else '<span class="tchev empty"></span>'
+    )
+    html_out = (
+        f'<div class="tnode open{root_current}">'
+        f'<div class="trow">{root_chev}'
         f'<a class="tlink{root_active}" href="/">'
         '<span class="tfolder root"></span>'
-        '<span class="tname">/</span></a>'
+        '<span class="tname">/</span></a></div>'
         f"{children}</div>"
     )
+    _SIDEBAR_CACHE.update({"html": html_out, "ts": now, "for": cur})
+    return html_out
 
 
 # ---------------------------------------------------------------------------
@@ -925,6 +998,25 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             return b""
         return self.rfile.read(length)
 
+    def _read_body_stream(self, on_chunk) -> int:
+        """Read request body in chunks, calling ``on_chunk(bytes)``. Returns total bytes."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            return 0
+        remaining = length
+        total = 0
+        while remaining > 0:
+            chunk = self.rfile.read(min(CHUNK_SIZE, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            total += len(chunk)
+            on_chunk(chunk)
+        return total
+
     def _target_dir(self) -> Optional[Path]:
         """Directory that POST operations act on (current listing path)."""
         path = self._resolve_path()
@@ -956,6 +1048,12 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             return self._handle_copy()
         if api == "tree":
             return self._handle_tree()
+        if api == "jobstatus":
+            return self._handle_jobstatus()
+        if api == "search":
+            return self._handle_search()
+        if api == "save":
+            return self._handle_save()
         self._json_response(HTTPStatus.NOT_FOUND, {"ok": False, "error": "unknown route"})
 
     def _handle_upload(self):
@@ -967,29 +1065,53 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
         if "multipart/form-data" not in ctype:
             self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "expected multipart"})
             return
-        body = self._read_body()
-        if not body:
-            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "empty body"})
-            return
         boundary_m = re.search(r'boundary="?([^";]+)"?', ctype)
         if not boundary_m:
             self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "no boundary"})
             return
-        boundary = boundary_m.group(1).encode("utf-8", "replace")
-        saved = []
-        for part in body.split(b"--" + boundary):
-            if b"Content-Disposition" not in part:
-                continue
-            fn_m = re.search(br'filename="([^"]*)"', part)
+        boundary = b"--" + boundary_m.group(1).encode("utf-8", "replace")
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "empty body"})
+            return
+
+        # Stream multipart: read chunks, split on boundary, write files as we go
+        # (never hold the entire body in RAM — makes large uploads fast + flat memory).
+        saved: list = []
+        state = {
+            "buf": b"",
+            "remaining": length,
+            "phase": "preamble",  # preamble | headers | body
+            "cur_name": None,
+            "cur_fp": None,
+            "cur_path": None,
+        }
+
+        def _close_current():
+            if state["cur_fp"] is not None:
+                try:
+                    state["cur_fp"].close()
+                except OSError:
+                    pass
+                state["cur_fp"] = None
+            state["cur_name"] = None
+            state["cur_path"] = None
+
+        def _open_part(header_blob: bytes) -> bool:
+            if b"Content-Disposition" not in header_blob:
+                return False
+            fn_m = re.search(br'filename="([^"]*)"', header_blob)
             if not fn_m:
-                # RFC 5987 filename*
-                fn_m = re.search(br"filename\*=UTF-8''([^\r\n;]+)", part)
+                fn_m = re.search(br"filename\*=UTF-8''([^\r\n;]+)", header_blob)
                 if not fn_m:
-                    continue
+                    return False
                 try:
                     fname = urllib.parse.unquote(fn_m.group(1).decode("utf-8", "replace"))
                 except Exception:
-                    continue
+                    return False
             else:
                 try:
                     fname = fn_m.group(1).decode("utf-8")
@@ -997,21 +1119,162 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
                     fname = fn_m.group(1).decode("latin-1")
             safe = self._safe_name(Path(fname).name, allow_basename=True)
             if not safe:
-                continue
-            header_end = part.find(b"\r\n\r\n")
-            if header_end < 0:
-                continue
-            content = part[header_end + 4:]
-            # strip trailing CRLF that belongs to the multipart framing
-            if content.endswith(b"\r\n"):
-                content = content[:-2]
+                return False
             dest = target / safe
-            # avoid silent overwrite of a different existing name? keep simple: overwrite allowed
             try:
-                dest.write_bytes(content)
-                saved.append(safe)
+                state["cur_fp"] = open(dest, "wb")
             except OSError as exc:
-                logger.warning("upload failed for %s: %s", safe, exc)
+                logger.warning("upload open failed for %s: %s", safe, exc)
+                return False
+            state["cur_name"] = safe
+            state["cur_path"] = dest
+            return True
+
+        def process_buf(final: bool = False):
+            buf = state["buf"]
+            # Hold back enough bytes that a split boundary + leading CRLF can still match.
+            hold = len(boundary) + 4
+            while buf:
+                if state["phase"] == "preamble":
+                    idx = buf.find(boundary)
+                    if idx < 0:
+                        if final:
+                            state["buf"] = b""
+                        elif len(buf) > hold:
+                            state["buf"] = buf[-hold:]
+                        else:
+                            state["buf"] = buf
+                        return
+                    buf = buf[idx + len(boundary):]
+                    if buf.startswith(b"--"):
+                        state["phase"] = "done"
+                        state["buf"] = b""
+                        return
+                    if buf.startswith(b"\r\n"):
+                        buf = buf[2:]
+                    elif not buf.startswith(b"\n"):
+                        # need more bytes to see CRLF after boundary
+                        state["buf"] = boundary + buf
+                        state["phase"] = "preamble"
+                        return
+                    state["phase"] = "headers"
+                    state["buf"] = buf
+                    continue
+
+                if state["phase"] == "headers":
+                    hend = buf.find(b"\r\n\r\n")
+                    if hend < 0:
+                        if len(buf) > 8192:
+                            state["phase"] = "skip"
+                            state["buf"] = buf
+                            return
+                        state["buf"] = buf
+                        return
+                    header_blob = buf[:hend]
+                    buf = buf[hend + 4:]
+                    _close_current()
+                    _open_part(header_blob)
+                    state["phase"] = "body"
+                    state["buf"] = buf
+                    continue
+
+                if state["phase"] == "body":
+                    idx = buf.find(boundary)
+                    if idx < 0:
+                        if final:
+                            # no closing boundary — flush rest as content
+                            if state["cur_fp"] is not None and buf:
+                                try:
+                                    if buf.endswith(b"\r\n"):
+                                        buf = buf[:-2]
+                                    state["cur_fp"].write(buf)
+                                except OSError as exc:
+                                    logger.warning("upload write failed: %s", exc)
+                            if state["cur_fp"] is not None and state["cur_name"]:
+                                saved.append(state["cur_name"])
+                            _close_current()
+                            state["buf"] = b""
+                            state["phase"] = "done"
+                            return
+                        if len(buf) > hold:
+                            data = buf[: len(buf) - hold]
+                            state["buf"] = buf[len(buf) - hold:]
+                            if state["cur_fp"] is not None and data:
+                                try:
+                                    state["cur_fp"].write(data)
+                                except OSError as exc:
+                                    logger.warning("upload write failed: %s", exc)
+                                    _close_current()
+                            return
+                        state["buf"] = buf
+                        return
+                    data = buf[:idx]
+                    if state["cur_fp"] is not None and data:
+                        # strip the CRLF that belongs to multipart framing
+                        if data.endswith(b"\r\n"):
+                            data = data[:-2]
+                        try:
+                            state["cur_fp"].write(data)
+                        except OSError as exc:
+                            logger.warning("upload write failed: %s", exc)
+                    if state["cur_fp"] is not None and state["cur_name"]:
+                        saved.append(state["cur_name"])
+                    _close_current()
+                    buf = buf[idx + len(boundary):]
+                    if buf.startswith(b"--"):
+                        state["phase"] = "done"
+                        state["buf"] = b""
+                        return
+                    if buf.startswith(b"\r\n"):
+                        buf = buf[2:]
+                    elif buf.startswith(b"\n"):
+                        buf = buf[1:]
+                    elif len(buf) < 2:
+                        state["buf"] = boundary + buf
+                        return
+                    state["phase"] = "headers"
+                    state["buf"] = buf
+                    continue
+
+                if state["phase"] == "skip":
+                    idx = buf.find(boundary)
+                    if idx < 0:
+                        if final:
+                            state["buf"] = b""
+                            state["phase"] = "done"
+                            return
+                        state["buf"] = buf[-hold:] if len(buf) > hold else buf
+                        return
+                    buf = buf[idx + len(boundary):]
+                    if buf.startswith(b"--"):
+                        state["phase"] = "done"
+                        state["buf"] = b""
+                        return
+                    if buf.startswith(b"\r\n"):
+                        buf = buf[2:]
+                    state["phase"] = "headers"
+                    state["buf"] = buf
+                    continue
+
+                # done
+                state["buf"] = b""
+                return
+
+            state["buf"] = b""
+            if final and state["phase"] == "body":
+                # flush any tail without trailing boundary (malformed but finish file)
+                if state["cur_fp"] is not None and state["cur_name"]:
+                    saved.append(state["cur_name"])
+                _close_current()
+
+        def on_chunk(chunk: bytes):
+            state["buf"] += chunk
+            process_buf(final=False)
+
+        self._read_body_stream(on_chunk)
+        process_buf(final=True)
+        _close_current()
+
         if not saved:
             self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "no file received"})
             return
@@ -1193,23 +1456,46 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             if dest.resolve() == item.resolve():
                 self._json_response(HTTPStatus.OK, {"ok": True, "name": item.name, "dest": str(payload.get("dest"))})
                 return
-            if dest.exists():
-                self._json_response(HTTPStatus.CONFLICT, {"ok": False, "error": "already exists at destination"})
-                return
-            # prevent moving a folder into itself / its child
+            # reject moving a folder into itself or its child
             if item.is_dir():
                 try:
-                    item.resolve().relative_to(dest_dir.resolve())
+                    dest_dir.resolve().relative_to(item.resolve())
                     self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "cannot move into itself"})
                     return
                 except ValueError:
                     pass
-            shutil.move(str(item), str(dest))
+            if dest.exists():
+                self._json_response(HTTPStatus.CONFLICT, {"ok": False, "error": "already exists at destination"})
+                return
         except OSError as exc:
             self._json_response(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
             return
-        logger.info("Moved %s -> %s", item, dest)
-        self._json_response(HTTPStatus.OK, {"ok": True, "name": item.name, "dest": dest_dir.name or "/"})
+        # Run in background so long moves do not hit tunnel timeouts.
+        job_id = uuid.uuid4().hex
+        with _JOBS_LOCK:
+            _JOBS[job_id] = {"status": "running", "op": "move", "name": item.name}
+
+        def _run():
+            try:
+                shutil.move(str(item), str(dest))
+                with _JOBS_LOCK:
+                    _JOBS[job_id] = {
+                        "status": "done", "ok": True, "name": item.name,
+                        "dest": dest_dir.name or "/",
+                    }
+                logger.info("Moved %s -> %s", item, dest)
+            except PermissionError as exc:
+                with _JOBS_LOCK:
+                    _JOBS[job_id] = {
+                        "status": "done", "ok": False,
+                        "error": "file is in use or locked: " + (str(exc) or item.name),
+                    }
+            except OSError as exc:
+                with _JOBS_LOCK:
+                    _JOBS[job_id] = {"status": "done", "ok": False, "error": str(exc)}
+
+        threading.Thread(target=_run, daemon=True).start()
+        self._json_response(HTTPStatus.OK, {"ok": True, "pending": True, "job": job_id, "name": item.name})
 
     def _handle_copy(self):
         target = self._target_dir()
@@ -1226,26 +1512,123 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid destination"})
             return
         dest = dest_dir / item.name
-        if dest.exists():
-            self._json_response(HTTPStatus.CONFLICT, {"ok": False, "error": "already exists at destination"})
-            return
         if item.is_dir():
             try:
-                item.resolve().relative_to(dest_dir.resolve())
+                dest_dir.resolve().relative_to(item.resolve())
                 self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "cannot copy into itself"})
                 return
             except ValueError:
                 pass
-        try:
-            if item.is_dir():
-                shutil.copytree(item, dest)
-            else:
-                shutil.copy2(item, dest)
-        except OSError as exc:
-            self._json_response(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+        if dest.resolve() == item.resolve():
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "cannot copy onto itself"})
             return
-        logger.info("Copied %s -> %s", item, dest)
-        self._json_response(HTTPStatus.OK, {"ok": True, "name": item.name, "dest": dest_dir.name or "/"})
+        if dest.exists():
+            self._json_response(HTTPStatus.CONFLICT, {"ok": False, "error": "already exists at destination"})
+            return
+        job_id = uuid.uuid4().hex
+        with _JOBS_LOCK:
+            _JOBS[job_id] = {"status": "running", "op": "copy", "name": item.name}
+
+        def _run():
+            try:
+                if item.is_dir():
+                    shutil.copytree(item, dest)
+                else:
+                    shutil.copy2(item, dest)
+                with _JOBS_LOCK:
+                    _JOBS[job_id] = {
+                        "status": "done", "ok": True, "name": item.name,
+                        "dest": dest_dir.name or "/",
+                    }
+                logger.info("Copied %s -> %s", item, dest)
+            except PermissionError as exc:
+                with _JOBS_LOCK:
+                    _JOBS[job_id] = {
+                        "status": "done", "ok": False,
+                        "error": "file is in use or locked: " + (str(exc) or item.name),
+                    }
+            except OSError as exc:
+                with _JOBS_LOCK:
+                    _JOBS[job_id] = {"status": "done", "ok": False, "error": str(exc)}
+
+        threading.Thread(target=_run, daemon=True).start()
+        self._json_response(HTTPStatus.OK, {"ok": True, "pending": True, "job": job_id, "name": item.name})
+
+    def _handle_jobstatus(self):
+        try:
+            payload = json.loads(self._read_body().decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        job_id = str(payload.get("job", ""))
+        with _JOBS_LOCK:
+            job = _JOBS.get(job_id)
+            # prune finished jobs older than 10 minutes
+            now = time.time()
+            for k, v in list(_JOBS.items()):
+                if v.get("status") == "done" and v.get("_ts") and now - v["_ts"] > 600:
+                    _JOBS.pop(k, None)
+        if job is None:
+            self._json_response(HTTPStatus.NOT_FOUND, {"ok": False, "error": "unknown job"})
+            return
+        if job.get("status") == "running":
+            self._json_response(HTTPStatus.OK, {"ok": True, "running": True})
+            return
+        if job.get("ok"):
+            with _JOBS_LOCK:
+                job["_ts"] = time.time()
+            self._json_response(HTTPStatus.OK, {
+                "ok": True, "name": job.get("name", ""), "dest": job.get("dest", "/"),
+            })
+        else:
+            with _JOBS_LOCK:
+                job["_ts"] = time.time()
+            self._json_response(HTTPStatus.OK, {"ok": False, "error": job.get("error", "failed")})
+
+    def _handle_search(self):
+        """Recursive name search across the whole server (downloads root)."""
+        try:
+            payload = json.loads(self._read_body().decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        q = str(payload.get("q", "")).strip().lower()
+        if not q:
+            self._json_response(HTTPStatus.OK, {"ok": True, "results": []})
+            return
+        root = DOWNLOADS_DIR.resolve()
+        results = []
+        max_results = 300
+
+        def walk(directory: Path, rel_prefix: str):
+            if len(results) >= max_results:
+                return
+            try:
+                with os.scandir(directory) as it:
+                    entries = sorted(it, key=lambda e: e.name.lower())
+            except OSError:
+                return
+            for e in entries:
+                if len(results) >= max_results:
+                    return
+                if e.name.startswith("."):
+                    continue
+                rel = rel_prefix + e.name
+                try:
+                    is_dir = e.is_dir(follow_symlinks=False)
+                except OSError:
+                    is_dir = False
+                if q in e.name.lower():
+                    results.append({
+                        "name": e.name,
+                        "path": rel,
+                        "kind": 1 if is_dir else 2,
+                        "href": urllib.parse.quote(rel, safe="") + ("/" if is_dir else ""),
+                    })
+                if is_dir:
+                    walk(Path(e.path), rel + "/")
+
+        walk(root, "/")
+        logger.info("Search %r -> %d results", q, len(results))
+        self._json_response(HTTPStatus.OK, {"ok": True, "results": results})
 
     def _handle_tree(self):
         """JSON tree of all folders under downloads (for move/copy dest picker)."""
@@ -1284,19 +1667,198 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
         if path.is_dir():
             # Redirect directory requests without a trailing slash so relative
             # links inside the listing work correctly.
-            if not self.path.rstrip("?").endswith("/"):
+            path_only = urllib.parse.urlparse(self.path).path
+            if not path_only.endswith("/"):
                 self.send_response(HTTPStatus.MOVED_PERMANENTLY)
-                self.send_header("Location", self.path.split("?")[0] + "/")
+                self.send_header("Location", path_only + "/" + (
+                    ("?" + urllib.parse.urlparse(self.path).query)
+                    if urllib.parse.urlparse(self.path).query else ""
+                ))
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return None
             if query.get("zip"):
                 return self._send_zip(path)
+            items_list = query.get("items") or []
+            names = []
+            for v in items_list:
+                names.extend([n for n in str(v).split(",") if n])
+            if names:
+                return self._send_zip_items(path, names)
             return self.list_directory(str(path))
 
         if query.get("zip"):
             return self._send_zip(path)
+        if query.get("edit"):
+            return self._render_editor(path)
+        if query.get("inline"):
+            return self._send_file(path, inline=True)
         return self._send_file(path)
+
+    def _send_zip_items(self, directory: Path, names: list):
+        """Stream a ZIP of selected items inside *directory*."""
+        try:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for name in names:
+                    item = self._item_in(directory, name)
+                    if item is None or not item.exists() or self._is_hidden(item):
+                        continue
+                    if item.is_dir():
+                        for root, _dirs, files in os.walk(item):
+                            for fn in files:
+                                full = Path(root) / fn
+                                if self._is_hidden(full):
+                                    continue
+                                zf.write(full, full.relative_to(directory))
+                    else:
+                        zf.write(item, item.name)
+                zip_name = (directory.name or "selected") + ".zip"
+            data = buf.getvalue()
+        except OSError:
+            self.send_error(HTTPStatus.NOT_FOUND, "Cannot create ZIP")
+            return None
+        safe_ascii = "".join(
+            ch if 32 <= ord(ch) < 127 and ch not in '"\\' else "_"
+            for ch in zip_name
+        )
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header(
+            "Content-Disposition",
+            f'attachment; filename="{safe_ascii}"; '
+            f"filename*=UTF-8''{urllib.parse.quote(zip_name)}",
+        )
+        self.end_headers()
+        return io.BytesIO(data)
+
+    def _render_editor(self, path: Path):
+        """Serve a standalone text/code editor page for *path*."""
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            self.send_error(HTTPStatus.NOT_FOUND, "Cannot read file")
+            return None
+        size = path.stat().st_size if path.exists() else 0
+        if size > 5 * 1024 * 1024:
+            self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "File too large to edit")
+            return None
+        name = html.escape(path.name)
+        esc_text = html.escape(text)
+        theme = "dark"
+        page = (
+            "<!DOCTYPE html>\n"
+            '<html lang="en" data-theme="dark">\n'
+            "<head>\n"
+            '<meta charset="utf-8">\n'
+            "<script>try{var t=localStorage.getItem('bs-theme');"
+            "if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>\n"
+            '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+            f"<title>Editor - {name} - Black Server</title>\n"
+            "<style>\n"
+            ":root{--bg:#0b0f17;--panel:#111827;--panel2:#1f2937;--border:#273244;"
+            "--text:#e5e7eb;--text2:#9ca3af;--blue:#3b82f6;--green:#22c55e;--red:#ef4444;}\n"
+            "html[data-theme=light]{--bg:#f3f4f6;--panel:#ffffff;--panel2:#e5e7eb;"
+            "--border:#d1d5db;--text:#111827;--text2:#6b7280;}\n"
+            "*{box-sizing:border-box;margin:0;padding:0;}\n"
+            "body{background:var(--bg);color:var(--text);font-family:Segoe UI,system-ui,sans-serif;"
+            "height:100vh;display:flex;flex-direction:column;overflow:hidden;}\n"
+            ".ehead{display:flex;align-items:center;gap:12px;padding:10px 16px;"
+            "background:var(--panel);border-bottom:1px solid var(--border);flex-shrink:0;}\n"
+            ".ehead .ename{font-weight:700;font-size:14px;overflow:hidden;"
+            "text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;}\n"
+            ".ehead .esize{color:var(--text2);font-size:12px;white-space:nowrap;}\n"
+            ".ebtn{border:1px solid var(--border);background:var(--panel2);color:var(--text);"
+            "padding:7px 14px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;"
+            "transition:background .12s;}\n"
+            ".ebtn:hover{background:var(--border);}\n"
+            ".ebtn.primary{background:var(--blue);border-color:var(--blue);color:#fff;}\n"
+            ".ebtn.primary:hover{filter:brightness(1.1);}\n"
+            ".ebtn.primary.saved{background:var(--green);border-color:var(--green);}\n"
+            ".estat{font-size:12px;color:var(--text2);min-width:60px;text-align:left;}\n"
+            ".estat.ok{color:var(--green);}\n"
+            ".estat.err{color:var(--red);}\n"
+            "#editor{flex:1;min-height:0;width:100%;border:none;outline:none;resize:none;"
+            "background:var(--bg);color:var(--text);font-family:Consolas,Menlo,monospace;"
+            "font-size:13.5px;line-height:1.55;padding:16px 18px;tab-size:4;white-space:pre;"
+            "overflow:auto;}\n"
+            "#editor::selection{background:rgba(59,130,246,.35);}\n"
+            "</style>\n"
+            "</head>\n"
+            "<body>\n"
+            '<div class="ehead">\n'
+            f'<span class="ename">{name}</span>\n'
+            f'<span class="esize">{human_size(size)}</span>\n'
+            '<span class="estat" id="estat"></span>\n'
+            '<button class="ebtn" type="button" onclick="history.back()">Back</button>\n'
+            '<button class="ebtn primary" type="button" id="saveBtn" onclick="saveFile()">Save</button>\n'
+            "</div>\n"
+            '<textarea id="editor" spellcheck="false" autocomplete="off" '
+            'autocorrect="off" autocapitalize="off">'
+            f"{esc_text}</textarea>\n"
+            "<script>\n"
+            "var FILENAME=" + json.dumps(name) + ";\n"
+            "function saveFile(){\n"
+            "  var btn=document.getElementById('saveBtn');\n"
+            "  var st=document.getElementById('estat');\n"
+            "  var ta=document.getElementById('editor');\n"
+            "  btn.disabled=true; st.textContent='Saving...'; st.className='estat';\n"
+            "  btn.textContent='Saving...';\n"
+            "  fetch(location.pathname+'?__api=save',{\n"
+            "    method:'POST',headers:{'Content-Type':'application/json'},\n"
+            "    body:JSON.stringify({content:ta.value})\n"
+            "  }).then(function(r){return r.json().then(function(j){return {s:r.status,j:j};});})\n"
+            "  .then(function(res){\n"
+            "    btn.disabled=false; btn.textContent='Save';\n"
+            "    if(res.j&&res.j.ok){\n"
+            "      st.textContent='Saved'; st.className='estat ok';\n"
+            "      btn.classList.add('saved');\n"
+            "      setTimeout(function(){btn.classList.remove('saved');st.textContent='';st.className='estat';},2000);\n"
+            "    }else{\n"
+            "      st.textContent=(res.j&&res.j.error)||'Save failed'; st.className='estat err';\n"
+            "    }\n"
+            "  }).catch(function(){\n"
+            "    btn.disabled=false; btn.textContent='Save';\n"
+            "    st.textContent='Network error'; st.className='estat err';\n"
+            "  });\n"
+            "}\n"
+            "document.getElementById('editor').addEventListener('keydown',function(e){\n"
+            "  if((e.ctrlKey||e.metaKey)&&e.key==='s'){e.preventDefault();saveFile();}\n"
+            "});\n"
+            "</script>\n"
+            "</body>\n"
+            "</html>\n"
+        )
+        data = page.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        return io.BytesIO(data)
+
+    def _handle_save(self):
+        path = self._resolve_path()
+        if path is None or path.is_dir() or self._is_hidden(path):
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "bad file"})
+            return
+        payload = self._payload()
+        content = payload.get("content", "")
+        if not isinstance(content, str):
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "bad content"})
+            return
+        data = content.encode("utf-8")
+        if len(data) > 10 * 1024 * 1024:
+            self._json_response(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "file too large"})
+            return
+        try:
+            path.write_bytes(data)
+        except OSError as exc:
+            self._json_response(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+            return
+        logger.info("Saved %s (%d bytes)", path, len(data))
+        self._json_response(HTTPStatus.OK, {"ok": True, "name": path.name, "size": len(data)})
 
     def _send_zip(self, path: Path):
         """Stream *path* (file or folder) as a ZIP archive."""
@@ -1334,7 +1896,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         return io.BytesIO(data)
 
-    def _send_file(self, path: Path):
+    def _send_file(self, path: Path, inline: bool = False):
         try:
             file_obj = open(path, "rb")
         except OSError:
@@ -1371,7 +1933,10 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(self._bytes_to_send))
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("Last-Modified", self.date_time_string(stat.st_mtime))
-            self.send_header("Content-Disposition", self._content_disposition(path.name))
+            if inline:
+                self.send_header("Content-Disposition", "inline")
+            else:
+                self.send_header("Content-Disposition", self._content_disposition(path.name))
             self.end_headers()
 
             if start:
@@ -1441,16 +2006,27 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     # -- directory listing -------------------------------------------------
     def list_directory(self, path):
         try:
-            entries = sorted(os.listdir(path), key=str.lower)
+            raw_entries = os.listdir(path)
         except OSError:
             self.send_error(HTTPStatus.NOT_FOUND, "No permission to list directory")
             return None
 
         # Hide dot-files from the public listing.
-        entries = [name for name in entries if not name.startswith(".")]
+        raw_entries = [name for name in raw_entries if not name.startswith(".")]
 
         root = DOWNLOADS_DIR.resolve()
         current = Path(path)
+
+        def _entry_sort_key(name: str):
+            try:
+                is_dir = (current / name).is_dir()
+            except OSError:
+                is_dir = False
+            return (0 if is_dir else 1, name.lower())
+
+        # Folders always first, then files (each group A→Z).
+        entries = sorted(raw_entries, key=_entry_sort_key)
+
         display_path = "/" + current.relative_to(root).as_posix().lstrip("./")
         if display_path == "/.":
             display_path = "/"
@@ -1466,8 +2042,10 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
             rows.append(
                 '<div class="frow dir parent-row" data-href="../" data-name=".." '
                 'data-kind="0" data-size="-1" data-mtime="0" '
-                'onclick="goParent()" '
+                'onclick="onRowClick(event, this)" '
+                'ondblclick="onRowDblClick(event, this)" '
                 'onmouseenter="hoverRow(this)" onmouseleave="unhoverRow(this)">'
+                '<div class="fcell fchk"></div>'
                 '<div class="fcell fname">'
                 '<span class="badge folder">&#8617;</span>'
                 '<span class="ftext"><span class="flabel">..</span>'
@@ -1492,16 +2070,22 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
 
             if full.is_dir():
                 href = link + "/"
+                dir_files, dir_bytes = _folder_stats(full)
+                dir_stats = f"{dir_files} files &middot; {human_size(dir_bytes)}"
                 rows.append(
                     f'<div class="frow dir" data-href="{href}" data-name="{label}" '
-                    f'data-kind="1" data-size="-1" data-mtime="{int(mtime)}" '
-                    f'onclick="goDir(\'{href}\')" '
+                    f'data-kind="1" data-size="{dir_bytes}" data-mtime="{int(mtime)}" '
+                    f'onclick="onRowClick(event, this)" '
+                    f'ondblclick="onRowDblClick(event, this)" '
                     f'onmouseenter="hoverRow(this)" onmouseleave="unhoverRow(this)">'
+                    f'<div class="fcell fchk" onclick="event.stopPropagation()">'
+                    f'<input type="checkbox" class="chk" onchange="onCheckChange(this)">'
+                    f'</div>'
                     f'<div class="fcell fname">'
                     f'<span class="badge folder">&#128193;</span>'
                     f'<span class="ftext"><span class="flabel">{label}</span>'
-                    f'<span class="fsub">Folder</span></span></div>'
-                    f'<div class="fcell fsize">&mdash;</div>'
+                    f'<span class="fsub">{dir_stats}</span></span></div>'
+                    f'<div class="fcell fsize">{human_size(dir_bytes)}</div>'
                     f'<div class="fcell fmtime">{_fmt_mtime(mtime)}</div>'
                     f'<div class="fcell fdot">'
                     f'<button class="dots" type="button" title="More" '
@@ -1531,11 +2115,15 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
                 if first_file_json == "null":
                     first_file_json = meta
                 rows.append(
-                    f'<div class="frow file" data-meta=\'{meta}\' '
+                    f'<div class="frow file" data-meta="{html.escape(meta, quote=True)}" '
                     f'data-name="{label}" data-kind="2" data-size="{size_b}" '
                     f'data-mtime="{int(mtime)}" '
-                    f'onclick="selectFile(this)" '
+                    f'onclick="onRowClick(event, this)" '
+                    f'ondblclick="onRowDblClick(event, this)" '
                     f'onmouseenter="hoverRow(this)" onmouseleave="unhoverRow(this)">'
+                    f'<div class="fcell fchk" onclick="event.stopPropagation()">'
+                    f'<input type="checkbox" class="chk" onchange="onCheckChange(this)">'
+                    f'</div>'
                     f'<div class="fcell fname">{badge}'
                     f'<span class="ftext"><span class="flabel">{label}</span>'
                     f'<span class="fsub">{type_label} &middot; {size_str}</span></span></div>'
@@ -1561,6 +2149,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
 <html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
+<script>try{{var t=localStorage.getItem("bs-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}}catch(e){{}}</script>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>File Manager - Black Server</title>
@@ -1598,6 +2187,9 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     --glass-bg: rgba(14,22,40,.92);
     --input-bg: #0e1628;
     --body-transition: background .45s ease, color .45s ease;
+    --scroll-thumb: rgba(79,140,255,.55);
+    --scroll-thumb-hover: rgba(109,150,255,.85);
+    --scroll-track: rgba(255,255,255,.04);
   }}
 
   [data-theme="light"] {{
@@ -1631,6 +2223,9 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     --glass-bg: rgba(255,255,255,.88);
     --input-bg: #ffffff;
     --body-transition: background .45s ease, color .45s ease;
+    --scroll-thumb: rgba(59,130,246,.45);
+    --scroll-thumb-hover: rgba(37,99,235,.75);
+    --scroll-track: rgba(0,0,0,.05);
   }}
   /* fix typo-safe: real value */
   [data-theme="light"] {{ --switch-bg: #d8dfec; }}
@@ -1641,8 +2236,11 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   body {{
     background: var(--bg);
     color: var(--text);
-    min-height: 100vh;
+    height: 100vh;
     padding: 18px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
     transition: var(--body-transition);
   }}
   body, .app, .topbar, .machine, .metric, .gear, .search input,
@@ -1652,13 +2250,36 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
                 border-color .45s ease, box-shadow .45s ease;
   }}
 
+  /* ===== SCROLLBARS ===== */
+  * {{
+    scrollbar-width: thin;
+    scrollbar-color: var(--scroll-thumb) var(--scroll-track);
+  }}
+  ::-webkit-scrollbar {{ width: 10px; height: 10px; }}
+  ::-webkit-scrollbar-track {{ background: var(--scroll-track); }}
+  ::-webkit-scrollbar-thumb {{
+    background: linear-gradient(180deg, var(--scroll-thumb), rgba(109,77,246,.55));
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }}
+  ::-webkit-scrollbar-thumb:hover {{
+    background: linear-gradient(180deg, var(--scroll-thumb-hover), rgba(139,92,246,.8));
+    background-clip: padding-box;
+  }}
+  ::-webkit-scrollbar-corner {{ background: transparent; }}
+
   /* ===== TOP BAR ===== */
   .topbar {{
     display: flex; align-items: center; gap: 14px;
     margin-bottom: 16px;
+    position: relative;
+    z-index: 120;
+    flex-shrink: 0;
   }}
   .search {{
     flex: 1; max-width: 520px; position: relative;
+    z-index: 121;
   }}
   .search svg {{
     position: absolute; left: 14px; top: 50%; transform: translateY(-50%);
@@ -1666,7 +2287,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     pointer-events: none;
   }}
   .search input {{
-    width: 100%; padding: 12px 16px 12px 42px;
+    width: 100%; padding: 12px 52px 12px 42px;
     background: var(--panel); border: 1px solid var(--border);
     border-radius: 12px; color: var(--text); font-size: 14px;
     outline: none; transition: border-color .2s, box-shadow .2s, background .45s;
@@ -1676,6 +2297,66 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     border-color: var(--blue);
     box-shadow: 0 0 0 3px rgba(59,130,246,.2);
   }}
+  .search-scope {{
+    position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+    z-index: 130;
+  }}
+  .scope-dots {{
+    width: 34px; height: 34px; border-radius: 9px;
+    background: var(--panel2); border: 1px solid var(--border);
+    color: var(--text2); font-size: 18px; line-height: 1;
+    cursor: pointer; transition: all .15s;
+    display: flex; align-items: center; justify-content: center;
+    padding: 0;
+  }}
+  .scope-dots:hover, .scope-dots.on {{
+    border-color: var(--blue); color: var(--text);
+    background: var(--panel3);
+  }}
+  .scope-menu {{
+    position: absolute; right: 0; top: calc(100% + 8px);
+    min-width: 230px; z-index: 200;
+    background: var(--glass-bg); border: 1px solid var(--border2);
+    border-radius: 14px; overflow: hidden;
+    box-shadow: 0 16px 48px rgba(0,0,0,.4), inset 0 1px 0 rgba(255,255,255,.06);
+    backdrop-filter: blur(24px) saturate(1.3);
+    -webkit-backdrop-filter: blur(24px) saturate(1.3);
+    display: none;
+    transform-origin: top right;
+    animation: scopePop .16s cubic-bezier(.16,1,.3,1);
+  }}
+  .scope-menu.open {{ display: block; }}
+  @keyframes scopePop {{
+    from {{ opacity: 0; transform: translateY(-6px) scale(.97); }}
+    to {{ opacity: 1; transform: translateY(0) scale(1); }}
+  }}
+  .scope-menu button {{
+    display: flex; align-items: center; gap: 10px;
+    width: 100%; text-align: right;
+    padding: 11px 14px; border: none; background: transparent;
+    color: var(--text2); cursor: pointer;
+    transition: background .12s, color .12s;
+  }}
+  .scope-menu button + button {{ border-top: 1px solid var(--border); }}
+  .scope-menu button:hover {{ background: var(--hover); color: var(--text); }}
+  .scope-menu button.on {{ background: rgba(59,130,246,.12); color: var(--text); }}
+  .sm-icon {{
+    width: 32px; height: 32px; border-radius: 9px; flex-shrink: 0;
+    background: var(--panel3); border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 15px;
+  }}
+  .scope-menu button.on .sm-icon {{
+    background: rgba(59,130,246,.2); border-color: rgba(59,130,246,.45);
+  }}
+  .sm-text {{ display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }}
+  .sm-title {{ font-size: 13px; font-weight: 700; color: var(--text); }}
+  .sm-desc {{ font-size: 11px; color: var(--text3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  .sm-check {{
+    font-size: 14px; color: var(--blue); font-weight: 800;
+    opacity: 0; transform: scale(.5); transition: all .15s;
+  }}
+  .scope-menu button.on .sm-check {{ opacity: 1; transform: scale(1); }}
   .top-right {{
     margin-left: auto; display: flex; align-items: center; gap: 12px;
   }}
@@ -1795,6 +2476,13 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     overflow: hidden;
     animation: rise .45s cubic-bezier(.16,1,.3,1) both;
     transition: background .45s ease, border-color .45s ease, box-shadow .45s ease;
+    position: relative;
+    z-index: 1;
+    /* Flex column so .layout can shrink and #tbody becomes a real scroll box. */
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
   }}
   @keyframes rise {{
     from {{ opacity: 0; transform: translateY(16px); }}
@@ -1805,6 +2493,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     display: flex; align-items: center; justify-content: space-between;
     padding: 22px 26px 18px;
     border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
   }}
   .app-head h1 {{
     font-size: 26px; font-weight: 700; letter-spacing: -.02em;
@@ -1835,7 +2524,11 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   .layout {{
     display: grid;
     grid-template-columns: 210px 1fr 300px;
-    min-height: 520px;
+    /* One row that fills the flexed .app height and may shrink below content. */
+    grid-template-rows: minmax(0, 1fr);
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: hidden;
   }}
 
   /* ---- sidebar tree ---- */
@@ -1844,17 +2537,37 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     border-right: 1px solid var(--border);
     padding: 14px 10px;
     overflow-y: auto;
+    min-height: 0;
+    overscroll-behavior: contain;
   }}
-  .tkids {{ padding-left: 16px; }}
+  .tkids {{ padding-left: 4px; }}
   .tnode > .tkids {{ display: none; }}
   .tnode.open > .tkids {{ display: block; }}
+  .trow {{
+    display: flex; align-items: center; gap: 2px;
+    min-width: 0;
+  }}
+  .tchev {{
+    width: 18px; height: 18px; flex-shrink: 0;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: none; border: none; padding: 0; margin: 0;
+    color: var(--text3); font-size: 9px; line-height: 1;
+    cursor: pointer; border-radius: 4px;
+    transition: transform .15s, color .12s, background .12s;
+  }}
+  .tchev:hover {{ color: var(--text); background: var(--hover); }}
+  .tchev.empty {{ visibility: hidden; cursor: default; }}
+  .tnode.open > .trow .tchev {{ transform: rotate(90deg); }}
+  .tnode.current > .trow .tchev {{ transform: rotate(100deg); color: var(--blue); }}
+  .tnode.open.current > .trow .tchev {{ transform: rotate(100deg); color: var(--blue); }}
   .tlink {{
     display: flex; align-items: center; gap: 8px;
-    padding: 7px 10px; border-radius: 8px;
+    padding: 7px 8px; border-radius: 8px;
     color: var(--text2); text-decoration: none;
     font-size: 13.5px; font-weight: 500;
     transition: all .15s;
     white-space: nowrap; overflow: hidden;
+    flex: 1; min-width: 0;
   }}
   .tlink:hover {{ background: var(--hover); color: var(--text); }}
   .tlink.active {{
@@ -1862,13 +2575,13 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   }}
   .tfolder {{
     width: 16px; height: 12px; flex-shrink: 0;
-    background: linear-gradient(180deg, #5b9dff, #3b82f6);
+    background: linear-gradient(180deg, #fbbf24, #f59e0b);
     border-radius: 2px 3px 3px 3px;
     position: relative;
   }}
   .tfolder::before {{
     content: ""; position: absolute; top: -3px; left: 0;
-    width: 7px; height: 4px; background: #5b9dff;
+    width: 7px; height: 4px; background: #fbbf24;
     border-radius: 2px 2px 0 0;
   }}
   .tfolder.root {{ background: linear-gradient(180deg, #94a3b8, #64748b); }}
@@ -1880,11 +2593,14 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     display: flex; flex-direction: column;
     border-right: 1px solid var(--border);
     min-width: 0;
+    min-height: 0;
+    overflow: hidden;
   }}
   .list-tools {{
     display: flex; align-items: center; justify-content: flex-end;
     gap: 10px; padding: 12px 16px;
     border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
   }}
   .view-toggle {{
     display: flex; background: var(--panel2);
@@ -1927,17 +2643,28 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
 
   .thead {{
     display: grid;
-    grid-template-columns: 1fr 90px 150px 40px;
+    grid-template-columns: 28px 1fr 90px 150px 40px;
     gap: 8px; padding: 10px 16px;
     border-bottom: 1px solid var(--border);
     font-size: 11.5px; font-weight: 700; letter-spacing: .04em;
     color: var(--text3); text-transform: uppercase;
+    flex-shrink: 0;
+    align-items: center;
   }}
-  .tbody {{ flex: 1; overflow-y: auto; padding: 6px 8px; }}
+  /* Independent scroll container for the file list.
+     Wheel over this region scrolls only the list (native nested overflow);
+     wheel outside scrolls the page as usual. */
+  .tbody {{
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 6px 8px;
+    overscroll-behavior: contain;
+  }}
 
   .frow {{
     display: grid;
-    grid-template-columns: 1fr 90px 150px 40px;
+    grid-template-columns: 28px 1fr 90px 150px 40px;
     gap: 8px; align-items: center;
     padding: 10px 10px; border-radius: 11px;
     cursor: pointer; border: 1.5px solid transparent;
@@ -1954,6 +2681,17 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     border-color: var(--sel-border);
     box-shadow: 0 0 0 1px var(--sel-border), 0 4px 16px rgba(59,130,246,.15);
   }}
+  .fchk {{
+    display: flex; align-items: center; justify-content: center;
+    position: relative; z-index: 1;
+  }}
+  .fchk .chk {{
+    width: 15px; height: 15px; margin: 0;
+    accent-color: var(--blue); cursor: pointer;
+    flex-shrink: 0;
+  }}
+  .parent-row .fchk {{ visibility: hidden; }}
+  .thead .fchk input {{ width: 15px; height: 15px; margin: 0; accent-color: var(--blue); cursor: pointer; }}
   .frow .fname {{
     display: flex; align-items: center; gap: 12px; min-width: 0;
   }}
@@ -2020,13 +2758,16 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   }}
   .empty-icon {{ font-size: 42px; margin-bottom: 12px; opacity: .5; }}
 
-  /* ---- right details panel ---- */
+  /* ---- right details panel (scrolls when content is tall) ---- */
   .details {{
     background: var(--details-bg);
     padding: 22px 18px;
     overflow-y: auto;
+    min-height: 0;
+    overscroll-behavior: contain;
     display: flex; flex-direction: column; gap: 22px;
   }}
+  .details > * {{ flex-shrink: 0; }}
   .detail-top {{
     display: flex; flex-direction: column; align-items: center;
     text-align: center; gap: 6px;
@@ -2136,6 +2877,10 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   }}
   .tbody.grid-view .fcell.fsize,
   .tbody.grid-view .fcell.fmtime {{ display: none; }}
+  .tbody.grid-view .fcell.fchk {{
+    position: absolute; top: 6px; left: 6px;
+    width: auto; z-index: 2;
+  }}
   .tbody.grid-view .fcell.fdot {{
     display: block;
     position: absolute; top: 6px; right: 6px;
@@ -2146,6 +2891,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     flex-direction: column; gap: 8px; width: 100%;
   }}
   .tbody.grid-view .badge {{ width: 52px; height: 52px; border-radius: 14px; font-size: 14px; margin: 0 auto; }}
+  .tbody.grid-view .badge.folder {{ font-size: 28px; line-height: 1; }}
   .tbody.grid-view .ftext {{ align-items: center; width: 100%; }}
   .tbody.grid-view .flabel {{
     white-space: normal; word-break: break-word; line-height: 1.3;
@@ -2385,19 +3131,46 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
 
   /* ---- responsive ---- */
   @media (max-width: 980px) {{
-    .layout {{ grid-template-columns: 1fr; }}
+    body {{
+      height: auto;
+      min-height: 100vh;
+      overflow: auto;
+    }}
+    .app {{ flex: none; }}
+    .layout {{ grid-template-columns: 1fr; grid-template-rows: none; overflow: visible; }}
     .sidebar {{ display: none; }}
-    .center {{ border-right: none; }}
-    .details {{ border-top: 1px solid var(--border); }}
+    .center {{
+      border-right: none;
+      height: calc(100dvh - 110px);
+      max-height: calc(100dvh - 110px);
+      min-height: 360px;
+      overflow: hidden;
+    }}
+    .list-tools {{ padding: 8px 12px; }}
+    .thead {{ padding: 7px 12px; }}
+    .frow {{ padding: 6px 8px; }}
+    .badge {{ width: 30px; height: 30px; font-size: 10px; }}
+    .details {{
+      border-top: 1px solid var(--border);
+      overflow: visible;
+      overscroll-behavior: auto;
+      max-height: none;
+      min-height: 0;
+    }}
     .metrics {{ display: none; }}
-    .thead, .frow {{ grid-template-columns: 1fr 80px 40px; }}
+    .thead, .frow {{ grid-template-columns: 28px 1fr 80px 40px; }}
     .thead .h-mtime, .frow .fmtime {{ display: none; }}
   }}
   @media (max-width: 600px) {{
     body {{ padding: 8px; }}
-    .app-head {{ flex-direction: column; gap: 14px; align-items: flex-start; }}
+    .app-head {{ flex-direction: column; gap: 10px; align-items: flex-start; }}
     .top-right .machine .mtext {{ display: none; }}
-    .thead, .frow {{ grid-template-columns: 1fr 40px; }}
+    .center {{
+      height: calc(100dvh - 90px);
+      max-height: calc(100dvh - 90px);
+      min-height: 320px;
+    }}
+    .thead, .frow {{ grid-template-columns: 28px 1fr 40px; }}
     .thead .h-size, .frow .fsize {{ display: none; }}
   }}
 </style>
@@ -2411,7 +3184,31 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
       <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>
     </svg>
     <input type="text" id="searchInput" placeholder="Search files, folders, or commands..."
-           oninput="filterRows()">
+           oninput="onSearchInput()">
+    <div class="search-scope" id="searchScope" title="Search scope">
+      <button type="button" class="scope-dots" id="scopeDots" aria-label="Search scope menu"
+              onclick="toggleScopeMenu(event)">&#8942;</button>
+      <div class="scope-menu" id="scopeMenu" role="menu">
+        <button type="button" class="on" data-scope="local" role="menuitem"
+                onclick="setSearchScope('local')">
+          <span class="sm-icon">&#128193;</span>
+          <span class="sm-text">
+            <span class="sm-title">سرچ در این پوشه</span>
+            <span class="sm-desc">فقط مسیر فعلی را جستجو کن</span>
+          </span>
+          <span class="sm-check">&#10003;</span>
+        </button>
+        <button type="button" data-scope="server" role="menuitem"
+                onclick="setSearchScope('server')">
+          <span class="sm-icon">&#127760;</span>
+          <span class="sm-text">
+            <span class="sm-title">سرچ در کل سرور</span>
+            <span class="sm-desc">همه پوشه‌ها و فایل‌ها</span>
+          </span>
+          <span class="sm-check">&#10003;</span>
+        </button>
+      </div>
+    </div>
   </div>
   <div class="top-right">
     <button class="theme-switch" id="themeSwitch" title="Toggle theme"
@@ -2432,7 +3229,8 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
       <div class="metric ram"><div class="mlabel">RAM</div><div class="mbar"><i></i></div></div>
       <div class="metric disk"><div class="mlabel">DISK</div><div class="mbar"><i></i></div></div>
     </div>
-    <button class="gear" title="Settings" onclick="openSettings()">&#9881;</button>
+    <button class="gear" type="button" id="gearBtn" title="Settings"
+            onclick="openSettings()" aria-label="Settings">&#9881;</button>
   </div>
 </div>
 
@@ -2477,6 +3275,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
         </div>
       </div>
       <div class="thead">
+        <div class="fchk"><input type="checkbox" id="chkAll" onchange="toggleAllChecks(this)" title="Select all"></div>
         <div>Name</div>
         <div class="h-size">Size</div>
         <div class="h-mtime">Last Modified</div>
@@ -2698,17 +3497,15 @@ var TOTAL = {file_count};
 (function init() {{
   if (SELECTED) applyMeta(SELECTED);
   else document.getElementById("dName").textContent = "No file selected";
-  var rows = document.querySelectorAll(".frow.file");
-  if (rows.length) selectFile(rows[0]);
   try {{
     var v = localStorage.getItem("bs-view");
     if (v === "grid" || v === "list") setView(v);
   }} catch (e) {{}}
   try {{
-    var th = localStorage.getItem("bs-theme");
-    if (th === "light" || th === "dark") {{
-      document.documentElement.setAttribute("data-theme", th);
-      updateThemeKnob();
+    var sk = localStorage.getItem("bs-sort");
+    if (sk === "size" || sk === "date" || sk === "name") {{
+      var sb = document.querySelector('.sort-menu button[data-k="' + sk + '"]');
+      if (sb) sortRows(sk, sb);
     }}
   }} catch (e) {{}}
 }})();
@@ -2743,12 +3540,157 @@ function applyMeta(m) {{
 }}
 
 function selectFile(row) {{
-  document.querySelectorAll(".frow.selected").forEach(function(r) {{
-    r.classList.remove("selected");
-  }});
+  selectOnly(row);
+}}
+
+function isMobile() {{
+  return window.matchMedia("(max-width: 980px)").matches;
+}}
+
+function onRowClick(e, row) {{
+  if (e && e.target && e.target.closest && e.target.closest(".fchk")) return;
+  if (row.classList.contains("parent-row")) {{ goParent(); return; }}
+  if (isMobile() && row.classList.contains("dir")) {{
+    goDir(row.getAttribute("data-href"));
+    return;
+  }}
+  selectOnly(row);
+}}
+
+function onRowDblClick(e, row) {{
+  if (e && e.target && e.target.closest && e.target.closest(".fchk")) return;
+  if (row.classList.contains("parent-row")) {{ goParent(); return; }}
+  if (row.classList.contains("dir")) {{
+    goDir(row.getAttribute("data-href"));
+    return;
+  }}
+  openFileRow(row);
+}}
+
+function selectOnly(row) {{
+  clearChecks();
+  var cb = row.querySelector(".chk");
+  if (cb) cb.checked = true;
   row.classList.add("selected");
-  try {{ applyMeta(JSON.parse(row.getAttribute("data-meta"))); }}
-  catch (e) {{}}
+  if (row.classList.contains("file")) {{
+    try {{ applyMeta(JSON.parse(row.getAttribute("data-meta"))); }}
+    catch (err) {{}}
+  }}
+  updateSelectionUI();
+}}
+
+function onCheckChange(cb) {{
+  var row = cb.closest(".frow");
+  if (!row) return;
+  if (cb.checked) {{
+    row.classList.add("selected");
+  }} else {{
+    row.classList.remove("selected");
+    row.style.background = "";
+  }}
+  updateSelectionUI();
+}}
+
+function getCheckedRows() {{
+  return Array.prototype.slice.call(document.querySelectorAll("#tbody .frow")).filter(function(r) {{
+    if (r.classList.contains("parent-row")) return false;
+    var c = r.querySelector(".chk");
+    return c && c.checked;
+  }});
+}}
+
+function getCheckedNames() {{
+  return getCheckedRows().map(function(r) {{ return r.getAttribute("data-name") || ""; }});
+}}
+
+function countChecked() {{
+  return getCheckedRows().length;
+}}
+
+function clearChecks() {{
+  document.querySelectorAll("#tbody .frow").forEach(function(r) {{
+    r.classList.remove("selected");
+    r.style.background = "";
+    var c = r.querySelector(".chk");
+    if (c) c.checked = false;
+  }});
+  var all = document.getElementById("chkAll");
+  if (all) all.checked = false;
+}}
+
+function toggleAllChecks(cb) {{
+  document.querySelectorAll("#tbody .frow").forEach(function(r) {{
+    if (r.classList.contains("parent-row")) return;
+    if (r.style.display === "none") return;
+    var c = r.querySelector(".chk");
+    if (c) {{
+      c.checked = cb.checked;
+      r.classList.toggle("selected", cb.checked);
+      if (!cb.checked) r.style.background = "";
+    }}
+  }});
+  updateSelectionUI();
+}}
+
+function updateSelectionUI() {{
+  var n = countChecked();
+  var sub1 = document.getElementById("dlSub1");
+  var sub2 = document.getElementById("dlSub2");
+  var dName = document.getElementById("dName");
+  var dIcon = document.getElementById("dIcon");
+  if (n > 1) {{
+    if (dName) dName.textContent = n + " items selected";
+    if (dIcon) {{ dIcon.className = "detail-icon file"; dIcon.innerHTML = "&#128193;"; }}
+    if (sub1) sub1.textContent = "Download " + n + " items as ZIP";
+    if (sub2) sub2.textContent = "ZIP " + n + " items";
+    var dSize = document.getElementById("dSize");
+    var dType = document.getElementById("dType");
+    var dMod = document.getElementById("dMod");
+    var dPerm = document.getElementById("dPerm");
+    if (dSize) dSize.textContent = "—";
+    if (dType) dType.textContent = "Multiple selection";
+    if (dMod) dMod.textContent = "—";
+    if (dPerm) dPerm.textContent = "—";
+  }} else if (n === 1) {{
+    var row = getCheckedRows()[0];
+    if (row && row.classList.contains("file")) {{
+      try {{ applyMeta(JSON.parse(row.getAttribute("data-meta"))); }} catch (e) {{}}
+    }} else if (row) {{
+      if (dName) dName.textContent = row.getAttribute("data-name") || "";
+      if (sub1) sub1.textContent = "Select a file";
+      if (sub2) sub2.textContent = "Compress and download";
+    }}
+  }} else {{
+    if (dName) dName.textContent = "No file selected";
+    if (sub1) sub1.textContent = "Select a file";
+    if (sub2) sub2.textContent = "Compress and download";
+  }}
+}}
+
+var IMG_EXT = {{png:1,jpg:1,jpeg:1,gif:1,webp:1,svg:1,ico:1,bmp:1,avif:1}};
+var TEXT_EXT = {{txt:1,html:1,htm:1,css:1,js:1,json:1,md:1,py:1,xml:1,yml:1,yaml:1,
+  csv:1,log:1,sh:1,bat:1,ps1:1,ts:1,jsx:1,tsx:1,vue:1,php:1,java:1,c:1,cpp:1,h:1,
+  go:1,rs:1,sql:1,ini:1,cfg:1,conf:1,toml:1,env:1,txt:1,rb:1,pl:1,r:1,m:1,swift:1,
+  kt:1,scala:1,dart:1,lua:1,ex:1,exs:1,clj:1,hs:1,ml:1,fs:1,asm:1,s:1,mk:1,cmake:1,
+  gradle:1,dockerfile:1,makefile:1,gitignore:1,npmrc:1,babelrc:1,eslintrc:1,prettierrc:1}};
+
+function openFileRow(row) {{
+  var meta = null;
+  try {{ meta = JSON.parse(row.getAttribute("data-meta")); }} catch (e) {{}}
+  if (!meta) {{
+    var href = row.getAttribute("data-href");
+    if (href) goDir(href);
+    return;
+  }}
+  var href = meta.href || "";
+  if (!href) return;
+  var ext = (meta.ext || "").toLowerCase();
+  var sep = href.indexOf("?") >= 0 ? "&" : "?";
+  if (IMG_EXT[ext]) {{
+    window.open(href + sep + "inline=1", "_blank");
+  }} else {{
+    window.open(href + sep + "edit=1", "_blank");
+  }}
 }}
 
 function goDir(href) {{ window.location.href = href; }}
@@ -2756,12 +3698,151 @@ function goParent() {{ window.location.href = "../"; }}
 function hoverRow(r) {{ if (!r.classList.contains("selected")) r.style.background = "var(--hover)"; }}
 function unhoverRow(r) {{ if (!r.classList.contains("selected")) r.style.background = ""; }}
 
+function toggleTNode(e, btn) {{
+  if (e) {{ e.preventDefault(); e.stopPropagation(); }}
+  var node = btn.closest(".tnode");
+  if (node) node.classList.toggle("open");
+}}
+
 function filterRows() {{
-  var q = document.getElementById("searchInput").value.toLowerCase();
-  document.querySelectorAll("#tbody .frow").forEach(function(r) {{
+  var q = document.getElementById("searchInput").value.trim().toLowerCase();
+  var rows = document.querySelectorAll("#tbody .frow");
+  if (!q) {{
+    rows.forEach(function(r) {{ r.style.display = ""; }});
+    var emptyOff = document.querySelector("#tbody .empty-state[data-filtered]");
+    if (emptyOff) emptyOff.style.display = "";
+    return;
+  }}
+  rows.forEach(function(r) {{
     var t = r.textContent.toLowerCase();
     r.style.display = t.indexOf(q) >= 0 ? "" : "none";
   }});
+  var empty = document.querySelector("#tbody .empty-state");
+  if (empty) empty.style.display = "none";
+}}
+
+/* ---- dual search: local folder vs whole server ---- */
+var SEARCH_SCOPE = "local";
+var _serverSearchTimer = null;
+var _localRowsHTML = null;
+
+function toggleScopeMenu(e) {{
+  if (e) e.stopPropagation();
+  var menu = document.getElementById("scopeMenu");
+  var dots = document.getElementById("scopeDots");
+  var open = menu.classList.toggle("open");
+  if (dots) dots.classList.toggle("on", open);
+}}
+
+function closeScopeMenu() {{
+  var menu = document.getElementById("scopeMenu");
+  var dots = document.getElementById("scopeDots");
+  if (menu) menu.classList.remove("open");
+  if (dots) dots.classList.remove("on");
+}}
+
+function setSearchScope(scope) {{
+  SEARCH_SCOPE = scope;
+  document.querySelectorAll("#scopeMenu button").forEach(function(b) {{
+    b.classList.toggle("on", b.getAttribute("data-scope") === scope);
+  }});
+  closeScopeMenu();
+  onSearchInput();
+}}
+
+function showAllRows() {{
+  document.querySelectorAll("#tbody .frow").forEach(function(r) {{ r.style.display = ""; }});
+  var empty = document.querySelector("#tbody .empty-state");
+  if (empty) empty.style.display = "";
+}}
+
+function onSearchInput() {{
+  var q = document.getElementById("searchInput").value.trim();
+  clearTimeout(_serverSearchTimer);
+  if (!q) {{
+    /* empty box -> normal full listing in both modes */
+    restoreLocalRows();
+    showAllRows();
+    return;
+  }}
+  if (SEARCH_SCOPE === "server") {{
+    _serverSearchTimer = setTimeout(function() {{ runServerSearch(q); }}, 300);
+  }} else {{
+    restoreLocalRows();
+    filterRows();
+  }}
+}}
+
+function restoreLocalRows() {{
+  var tb = document.getElementById("tbody");
+  if (_localRowsHTML !== null) {{
+    tb.innerHTML = _localRowsHTML;
+    _localRowsHTML = null;
+  }}
+}}
+
+function runServerSearch(q) {{
+  var tb = document.getElementById("tbody");
+  if (_localRowsHTML === null) _localRowsHTML = tb.innerHTML;
+  tb.innerHTML = '<div class="empty-state"><div class="empty-icon">\\u2315</div><div>Searching entire server...</div></div>';
+  fetch(location.pathname + "?__api=search", {{
+    method: "POST",
+    headers: {{ "Content-Type": "application/json" }},
+    body: JSON.stringify({{ q: q }})
+  }})
+    .then(function(r) {{ return r.json(); }})
+    .then(function(j) {{
+      if (!j || !j.ok) {{ tb.innerHTML = '<div class="empty-state"><div>Search failed</div></div>'; return; }}
+      var res = j.results || [];
+      if (!res.length) {{
+        tb.innerHTML = '<div class="empty-state"><div class="empty-icon">\\u2315</div><div>No matches on server for "' + escapeHtml(q) + '"</div></div>';
+        return;
+      }}
+      tb.innerHTML = res.map(function(it) {{
+        var isDir = it.kind === 1;
+        var sub = isDir ? "Folder" : "File";
+        if (isDir) {{
+          return '<div class="frow dir" data-href="' + it.href + '" data-name="' + escapeHtml(it.name) + '" ' +
+            'data-kind="1" data-size="-1" data-mtime="0" ' +
+            'onclick="onRowClick(event, this)" ' +
+            'ondblclick="onRowDblClick(event, this)" ' +
+            'onmouseenter="hoverRow(this)" onmouseleave="unhoverRow(this)">' +
+            '<div class="fcell fchk" onclick="event.stopPropagation()">' +
+            '<input type="checkbox" class="chk" onchange="onCheckChange(this)"></div>' +
+            '<div class="fcell fname"><span class="badge folder">\\ud83d\\udcc1</span>' +
+            '<span class="ftext"><span class="flabel">' + escapeHtml(it.name) + '</span>' +
+            '<span class="fsub">' + escapeHtml(it.path) + '</span></span></div>' +
+            '<div class="fcell fsize">&mdash;</div>' +
+            '<div class="fcell fmtime">&mdash;</div>' +
+            '<div class="fcell fdot"></div></div>';
+        }}
+        var fmeta = JSON.stringify({{
+          name: it.name, href: it.href, size: "", sizeB: 0,
+          type: "file", mtime: "", mtimeTs: 0, perm: "",
+          path: it.path, ext: (it.name.split(".").pop() || "file").toLowerCase()
+        }});
+        return '<div class="frow file" data-meta="' + escapeHtml(fmeta) + '" data-href="' + it.href + '" data-name="' + escapeHtml(it.name) + '" ' +
+          'data-kind="2" data-size="0" data-mtime="0" ' +
+          'onclick="onRowClick(event, this)" ' +
+          'ondblclick="onRowDblClick(event, this)" ' +
+          'onmouseenter="hoverRow(this)" onmouseleave="unhoverRow(this)">' +
+          '<div class="fcell fchk" onclick="event.stopPropagation()">' +
+          '<input type="checkbox" class="chk" onchange="onCheckChange(this)"></div>' +
+          '<div class="fcell fname"><span class="badge file">FILE</span>' +
+          '<span class="ftext"><span class="flabel">' + escapeHtml(it.name) + '</span>' +
+          '<span class="fsub">' + escapeHtml(it.path) + '</span></span></div>' +
+          '<div class="fcell fsize"></div>' +
+          '<div class="fcell fmtime"></div>' +
+          '<div class="fcell fdot"></div></div>';
+      }}).join("");
+    }})
+    .catch(function() {{
+      tb.innerHTML = '<div class="empty-state"><div>Connection error during search</div></div>';
+    }});
+}}
+
+function escapeHtml(s) {{
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }}
 
 function setView(v) {{
@@ -2779,6 +3860,7 @@ function toggleSort(e) {{
 }}
 document.addEventListener("click", function() {{
   document.getElementById("sortMenu").classList.remove("open");
+  closeScopeMenu();
   closeRowMenu();
 }});
 
@@ -2787,6 +3869,7 @@ function sortRows(key, btn) {{
     b.classList.remove("on");
   }});
   btn.classList.add("on");
+  try {{ localStorage.setItem("bs-sort", key); }} catch (e) {{}}
   var tb = document.getElementById("tbody");
   var empty = tb.querySelector(".empty-state");
   var rows = Array.prototype.slice.call(tb.querySelectorAll(".frow"));
@@ -2830,10 +3913,40 @@ function currentHref() {{
 }}
 
 function actDownload() {{
+  var checked = getCheckedRows();
+  if (checked.length > 1) {{
+    var names = checked.map(function(r) {{ return r.getAttribute("data-name") || ""; }});
+    window.location.href = location.pathname + "?" + names.map(function(n) {{
+      return "items=" + encodeURIComponent(n);
+    }}).join("&");
+    return;
+  }}
+  if (checked.length === 1) {{
+    var row = checked[0];
+    if (row.classList.contains("file")) {{
+      try {{ var m = JSON.parse(row.getAttribute("data-meta")); window.location.href = m.href; return; }} catch (e) {{}}
+    }}
+    var h = row.getAttribute("data-href");
+    if (h) {{ window.location.href = h + "?zip=1"; return; }}
+  }}
   if (!SELECTED) {{ toast("Select a file first"); return; }}
   window.location.href = SELECTED.href;
 }}
 function actZip() {{
+  var checked = getCheckedRows();
+  if (checked.length > 1) {{
+    var names = checked.map(function(r) {{ return r.getAttribute("data-name") || ""; }});
+    window.location.href = location.pathname + "?" + names.map(function(n) {{
+      return "items=" + encodeURIComponent(n);
+    }}).join("&");
+    return;
+  }}
+  if (checked.length === 1) {{
+    var row = checked[0];
+    var h = row.getAttribute("data-href");
+    if (h) {{ window.location.href = h + "?zip=1"; return; }}
+    try {{ var m = JSON.parse(row.getAttribute("data-meta")); window.location.href = m.href + "?zip=1"; return; }} catch (e) {{}}
+  }}
   if (!SELECTED) {{ toast("Select a file first"); return; }}
   window.location.href = SELECTED.href + "?zip=1";
 }}
@@ -3003,7 +4116,7 @@ document.addEventListener("keydown", function(e) {{
 }});
 
 /* ===== ROW CONTEXT MENU (three dots) ===== */
-var CTX = null; /* {{name, kind}} kind: 1=dir 2=file */
+var CTX = null; /* {{name, kind, multi, names}} kind: 1=dir 2=file */
 var destMode = null; /* "move" | "copy" | null */
 var destPath = "/";
 
@@ -3015,15 +4128,22 @@ function openRowMenu(e, btn) {{
   stopRowClick(e);
   var row = btn.closest(".frow");
   if (!row || row.classList.contains("parent-row")) return;
+  var multi = countChecked() > 1 && row.classList.contains("selected");
+  var names = multi ? getCheckedNames() : [row.getAttribute("data-name") || ""];
   CTX = {{
     name: row.getAttribute("data-name") || "",
-    kind: +(row.getAttribute("data-kind") || 2)
+    kind: +(row.getAttribute("data-kind") || 2),
+    multi: multi,
+    names: names
   }};
-  if (row.classList.contains("file")) {{
-    try {{ selectFile(row); }} catch (err) {{}}
+  if (row.classList.contains("file") && !multi) {{
+    try {{ selectOnly(row); }} catch (err) {{}}
+  }} else if (!multi && !row.classList.contains("parent-row")) {{
+    try {{ selectOnly(row); }} catch (err) {{}}
   }}
   var menu = document.getElementById("ctxMenu");
-  document.getElementById("ctxTitle").textContent = CTX.name;
+  document.getElementById("ctxTitle").textContent =
+    multi ? (names.length + " items") : CTX.name;
   document.querySelectorAll(".dots.open").forEach(function(d) {{ d.classList.remove("open"); }});
   btn.classList.add("open");
   menu.classList.add("open");
@@ -3054,21 +4174,67 @@ function ctxAction(action) {{
 }}
 
 function postApi(api, body) {{
-  return fetch(location.pathname + "?__api=" + api, {{
+  return fetchWithRetry(location.pathname + "?__api=" + api, {{
     method: "POST",
     headers: {{ "Content-Type": "application/json" }},
     body: JSON.stringify(body)
   }}).then(function(r) {{
     return r.json().then(function(j) {{ return {{s: r.status, j: j}}; }});
+  }}).then(function(res) {{
+    if (res.j && res.j.pending && res.j.job) {{
+      return pollJob(res.j.job, 0).then(function(done) {{ return done; }});
+    }}
+    return res;
+  }});
+}}
+
+function fetchWithRetry(url, opts, attempts) {{
+  attempts = attempts === undefined ? 3 : attempts;
+  return fetch(url, opts).then(function(r) {{
+    if (r.status >= 500 && attempts > 1) {{
+      return delay(600).then(function() {{ return fetchWithRetry(url, opts, attempts - 1); }});
+    }}
+    return r;
+  }}, function(err) {{
+    if (attempts > 1) {{
+      return delay(700).then(function() {{ return fetchWithRetry(url, opts, attempts - 1); }});
+    }}
+    throw err;
+  }});
+}}
+
+function delay(ms) {{ return new Promise(function(res) {{ setTimeout(res, ms); }}); }}
+
+function pollJob(jobId, attempt) {{
+  attempt = attempt || 0;
+  if (attempt > 120) {{
+    return Promise.resolve({{s: 500, j: {{ok: false, error: "Operation timed out"}}}});
+  }}
+  return delay(400).then(function() {{
+    return fetch(location.pathname + "?__api=jobstatus", {{
+      method: "POST",
+      headers: {{ "Content-Type": "application/json" }},
+      body: JSON.stringify({{ job: jobId }})
+    }}).then(function(r) {{
+      return r.json().then(function(j) {{ return {{s: r.status, j: j}}; }});
+    }}).then(function(res) {{
+      if (res.j && res.j.running) return pollJob(jobId, attempt + 1);
+      return res;
+    }}, function() {{
+      return pollJob(jobId, attempt + 1);
+    }});
   }});
 }}
 
 /* ---- delete ---- */
 function openDelModal() {{
   if (!CTX) return;
-  document.getElementById("delName").textContent = CTX.name;
+  var names = CTX.multi ? CTX.names : [CTX.name];
+  document.getElementById("delName").textContent =
+    CTX.multi ? (names.length + " items") : CTX.name;
   document.getElementById("delKind").textContent =
-    CTX.kind === 1 ? "Folder - removes all contents" : "File - permanent";
+    CTX.multi ? "Multiple items - permanent"
+    : (CTX.kind === 1 ? "Folder - removes all contents" : "File - permanent");
   document.getElementById("delModal").classList.add("open");
 }}
 function closeDelModal() {{
@@ -3076,29 +4242,45 @@ function closeDelModal() {{
 }}
 function confirmDelete() {{
   if (!CTX) return;
+  var names = CTX.multi ? CTX.names : [CTX.name];
   var ok = document.getElementById("delOk");
   ok.disabled = true;
   ok.textContent = "...";
-  postApi("delete", {{ name: CTX.name }})
-    .then(function(res) {{
-      ok.disabled = false;
-      ok.textContent = "حذف";
-      if (res.j && res.j.ok) {{
-        toast("Deleted: " + CTX.name);
+  var p = Promise.resolve();
+  names.forEach(function(n) {{
+    p = p.then(function() {{ return postApi("delete", {{ name: n }}); }});
+  }});
+  p.then(function(res) {{
+    ok.disabled = false;
+    ok.textContent = "حذف";
+    if (res && res.j && res.j.ok) {{
+      toast(names.length > 1 ? ("Deleted " + names.length + " items") : ("Deleted: " + names[0]));
+      closeDelModal();
+      setTimeout(function() {{ location.reload(); }}, 500);
+    }} else toast((res && res.j && res.j.error) || "Delete failed");
+  }})
+  .catch(function() {{
+    ok.disabled = false;
+    ok.textContent = "حذف";
+    toast("Connection error — retrying...");
+    var p2 = Promise.resolve();
+    names.forEach(function(n) {{
+      p2 = p2.then(function() {{ return postApi("delete", {{ name: n }}); }});
+    }});
+    p2.then(function(res) {{
+      if (res && res.j && res.j.ok) {{
+        toast("Deleted");
         closeDelModal();
         setTimeout(function() {{ location.reload(); }}, 500);
-      }} else toast((res.j && res.j.error) || "Delete failed");
-    }})
-    .catch(function() {{
-      ok.disabled = false;
-      ok.textContent = "حذف";
-      toast("Connection error");
-    }});
+      }} else toast((res && res.j && res.j.error) || "Delete failed");
+    }}).catch(function() {{ toast("Still offline — check your connection"); }});
+  }});
 }}
 
 /* ---- rename ---- */
 function openRenModal() {{
   if (!CTX) return;
+  if (CTX.multi) {{ toast("Rename works on a single item"); return; }}
   document.getElementById("renSub").textContent = CTX.name;
   var input = document.getElementById("renInput");
   input.value = CTX.name;
@@ -3139,7 +4321,14 @@ function confirmRename() {{
     .catch(function() {{
       ok.disabled = false;
       ok.textContent = "تایید";
-      toast("Connection error");
+      toast("Connection error — retrying...");
+      postApi("rename", {{ name: CTX.name, newName: nn }}).then(function(res) {{
+        if (res.j && res.j.ok) {{
+          toast("Renamed to: " + res.j.name);
+          closeRenModal();
+          setTimeout(function() {{ location.reload(); }}, 500);
+        }} else toast((res.j && res.j.error) || "Rename failed");
+      }}).catch(function() {{ toast("Still offline — check your connection"); }});
     }});
 }}
 
@@ -3150,12 +4339,13 @@ function openDestModal(mode) {{
   destPath = "/";
   document.getElementById("destTitle").textContent =
     mode === "move" ? "انتقال به..." : "کپی به...";
-  document.getElementById("destSub").textContent = CTX.name;
+  document.getElementById("destSub").textContent =
+    CTX.multi ? (CTX.names.length + " items") : CTX.name;
   document.getElementById("destHint").textContent = "مقصد: /";
   var tree = document.getElementById("destTree");
   tree.innerHTML = "<div style=\\"color:var(--text3);font-size:12px;padding:8px\\">Loading...</div>";
   document.getElementById("destModal").classList.add("open");
-  fetch(location.pathname + "?__api=tree", {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: "{{}}" }})
+  fetchWithRetry(location.pathname + "?__api=tree", {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: "{{}}" }})
     .then(function(r) {{ return r.json(); }})
     .then(function(j) {{
       tree.innerHTML = "";
@@ -3163,7 +4353,7 @@ function openDestModal(mode) {{
       else tree.innerHTML = "<div style=\\"color:var(--text3);font-size:12px;padding:8px\\">No folders</div>";
     }})
     .catch(function() {{
-      tree.innerHTML = "<div style=\\"color:var(--text3);font-size:12px;padding:8px\\">Error</div>";
+      tree.innerHTML = "<div style=\\"color:var(--text3);font-size:12px;padding:8px\\">Error — close and try again</div>";
     }});
 }}
 function renderDestTree(node, el, depth) {{
@@ -3187,35 +4377,71 @@ function closeDestModal() {{
   document.getElementById("destModal").classList.remove("open");
   destMode = null;
 }}
+function destErrorText(err, status) {{
+  err = String(err || "");
+  if (status === 409 || /exist|already/i.test(err)) return "در مقصد وجود دارد — نام دیگری انتخاب کنید یا ابتدا حذف کنید";
+  if (status === 400 && /into itself/i.test(err)) return "انتقال/کپی پوشه به درون خودش مجاز نیست";
+  if (status === 400 && /invalid destination/i.test(err)) return "مقصد نامعتبر است";
+  if (/locked|in use/i.test(err)) return "فایل در برنامه دیگری باز است — آن را ببندید";
+  if (status === 404 || /not found/i.test(err)) return "فایل پیدا نشد — صفحه را رفرش کنید";
+  return err || "عملیات ناموفق بود";
+}}
 function confirmDest() {{
   if (!CTX || !destMode) return;
   var ok = document.getElementById("destOk");
   ok.disabled = true;
   ok.innerHTML = "...<span class=\\"spinner\\"></span>";
-  postApi(destMode, {{ name: CTX.name, dest: destPath }})
-    .then(function(res) {{
-      ok.disabled = false;
-      ok.textContent = "تایید";
-      if (res.j && res.j.ok) {{
-        toast((destMode === "move" ? "Moved: " : "Copied: ") + CTX.name);
+  var names = CTX.multi ? CTX.names : [CTX.name];
+  var p = Promise.resolve();
+  var lastRes = null;
+  names.forEach(function(n) {{
+    p = p.then(function() {{
+      return postApi(destMode, {{ name: n, dest: destPath }});
+    }}).then(function(res) {{ lastRes = res; }});
+  }});
+  p.then(function() {{
+    ok.disabled = false;
+    ok.textContent = "تایید";
+    var res = lastRes;
+    if (res && res.j && res.j.ok) {{
+      toast((destMode === "move" ? "Moved: " : "Copied: ") +
+        (names.length > 1 ? (names.length + " items") : names[0]));
+      closeDestModal();
+      setTimeout(function() {{ location.reload(); }}, 500);
+    }} else toast(destErrorText(res && res.j && res.j.error, res && res.s));
+  }})
+  .catch(function() {{
+    ok.disabled = false;
+    ok.textContent = "تایید";
+    toast("Connection error — retrying...");
+    var p2 = Promise.resolve();
+    var last2 = null;
+    names.forEach(function(n) {{
+      p2 = p2.then(function() {{
+        return postApi(destMode, {{ name: n, dest: destPath }});
+      }}).then(function(res) {{ last2 = res; }});
+    }});
+    p2.then(function() {{
+      if (last2 && last2.j && last2.j.ok) {{
+        toast((destMode === "move" ? "Moved: " : "Copied: ") +
+          (names.length > 1 ? (names.length + " items") : names[0]));
         closeDestModal();
         setTimeout(function() {{ location.reload(); }}, 500);
-      }} else toast((res.j && res.j.error) || "Failed");
-    }})
-    .catch(function() {{
-      ok.disabled = false;
-      ok.textContent = "تایید";
-      toast("Connection error");
-    }});
+      }} else toast(destErrorText(last2 && last2.j && last2.j.error, last2 && last2.s));
+    }}).catch(function() {{ toast("Still offline — check your connection"); }});
+  }});
 }}
 
 /* ---- settings ---- */
 function openSettings() {{
-  syncSettingsUI();
-  document.getElementById("setModal").classList.add("open");
+  var m = document.getElementById("setModal");
+  if (!m) return;
+  try {{ syncSettingsUI(); }} catch (e) {{}}
+  m.classList.add("open");
 }}
 function closeSettings() {{
-  document.getElementById("setModal").classList.remove("open");
+  var m = document.getElementById("setModal");
+  if (m) m.classList.remove("open");
 }}
 function syncSettingsUI() {{
   var th = document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
@@ -3243,8 +4469,12 @@ function setPrefView(v) {{
         payload = page.encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        accept_enc = (self.headers.get("Accept-Encoding") or "").lower()
+        if "gzip" in accept_enc:
+            payload = gzip.compress(payload, compresslevel=5)
+            self.send_header("Content-Encoding", "gzip")
         self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         return io.BytesIO(payload)
 
@@ -3300,6 +4530,12 @@ def print_banner(
     print("Status:")
     print("ONLINE")
     print()
+    if public_url:
+        print("Note:")
+        print("Public URL changes every time the server restarts.")
+        print("If the page fails to open, copy the Public link again")
+        print("from this window (or check that the server is still running).")
+        print()
     print("Press Ctrl+C to stop the server.")
     print("========================================")
     print()
@@ -3429,6 +4665,33 @@ def run(args: argparse.Namespace) -> int:
         if tunnel is None:
             return 1
 
+        # Cloudflare can register yet the public hostname may still be
+        # unreachable from this network (DNS block, ISP filter, VPN).  Probe
+        # the URL before we announce ONLINE / open the browser; if it fails,
+        # fall back to the SSH tunnel providers.
+        if public_url and tunnel is not None and tunnel.registered:
+            print("[..] Verifying the Cloudflare public URL ...", flush=True)
+            if wait_reachable(public_url, tries=3, delay=2.0, timeout=8.0):
+                print("[OK] Cloudflare public URL is live.", flush=True)
+            elif args.allow_ssh_fallback:
+                print("[!] Cloudflare URL is registered but not reachable here.", flush=True)
+                print("    This network may block trycloudflare.com (DNS/SNI).", flush=True)
+                print("    Switching to the SSH fallback tunnel ...", flush=True)
+                tunnel.stop()
+                tunnel = None
+                public_url = None
+                ssh_tunnel, public_url = try_ssh_fallback(
+                    port, args.ssh_timeout,
+                    reason="Cloudflare URL failed the reachability check.",
+                )
+                if ssh_tunnel is None:
+                    print("[ERROR] SSH fallback also failed.", flush=True)
+                    print(f"        Local server still available at: {local_url}", flush=True)
+                    return 1
+            else:
+                print("[!] Could not verify the public URL (SSH fallback disabled).", flush=True)
+                print(f"    Local server still available at: {local_url}", flush=True)
+
         if public_url is None:
             # Cloudflare could not even mint a URL -> explain, then fall back.
             if tunnel.fatal_error:
@@ -3449,7 +4712,7 @@ def run(args: argparse.Namespace) -> int:
             if ssh_tunnel is None:
                 return 1
 
-        elif not tunnel.registered:
+        elif tunnel is not None and not tunnel.registered:
             # A URL is reserved as soon as the request reaches Cloudflare's API.
             # The public URL is only really usable once the tunnel's data plane
             # has connected to the edge ("Registered tunnel connection").
@@ -3504,10 +4767,16 @@ def run(args: argparse.Namespace) -> int:
                 if copy_to_clipboard(online_url):
                     print("[OK] Public URL copied to the clipboard.")
                 if not args.no_browser:
+                    # Give DNS a moment, then open; failures are non-fatal.
+                    time.sleep(0.4)
                     try:
                         webbrowser.open(online_url)
                     except Exception as exc:  # noqa: BLE001 - browser is optional
                         logger.warning("Could not open the browser: %s", exc)
+                print("[i] If the browser says 'This site can't be reached',")
+                print("    the Public URL above is still the right link — wait")
+                print("    a few seconds and refresh, or reopen it in another")
+                print("    network/VPN. Quick Tunnel URLs are temporary.")
             if ssh_tunnel is not None:
                 if ssh_tunnel.process and ssh_tunnel.process.poll() is not None:
                     print("[ERROR] The SSH tunnel stopped unexpectedly.")
