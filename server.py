@@ -1694,6 +1694,9 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
                 return self._send_zip_items(path, names)
             return self.list_directory(str(path))
 
+        if query.get("raw"):
+            # raw media bytes (used by <video>/<audio> src) — inline + Range
+            return self._send_file(path, inline=True)
         if query.get("zip"):
             return self._send_zip(path)
         if query.get("edit"):
@@ -1701,10 +1704,113 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
         if query.get("inline"):
             ext = path.suffix.lower()
             img_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".avif"}
+            vid_exts = {".mp4", ".webm", ".ogg", ".ogv", ".mov", ".mkv", ".avi", ".m4v", ".flv", ".wmv"}
             if ext in img_exts:
                 return self._render_image_viewer(path)
+            if ext in vid_exts:
+                return self._render_video_viewer(path)
             return self._send_file(path, inline=True)
         return self._send_file(path)
+
+    def _render_video_viewer(self, path: Path):
+        """Serve a fullscreen video player page fitted to the screen."""
+        try:
+            st = path.stat()
+        except OSError:
+            self.send_error(HTTPStatus.NOT_FOUND, "File not found")
+            return None
+        name = html.escape(path.name)
+        size = human_size(st.st_size)
+        src = html.escape(urllib.parse.quote(path.name))
+        page = (
+            "<!DOCTYPE html>\n"
+            '<html lang="en">\n'
+            "<head>\n"
+            '<meta charset="utf-8">\n'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+            "<title>" + name + " - Black Server</title>\n"
+            '<link rel="icon" href="/favicon.ico" sizes="any">\n'
+            "<style>\n"
+            "*{box-sizing:border-box;margin:0;padding:0;}\n"
+            "html,body{height:100%;width:100%;background:#000;overflow:hidden;}\n"
+            "body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;color:#e5e7eb;}\n"
+            ".vstage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#000;}\n"
+            ".vstage video{max-width:100%;max-height:100%;width:auto;height:auto;"
+            "object-fit:contain;background:#000;outline:none;}\n"
+            ".vbar{position:fixed;top:14px;left:14px;right:14px;display:flex;align-items:center;gap:10px;"
+            "z-index:5;background:rgba(10,14,22,.72);border:1px solid rgba(255,255,255,.12);"
+            "border-radius:12px;padding:8px 12px;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);}\n"
+            ".vname{font-weight:700;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;"
+            "white-space:nowrap;flex:1;min-width:0;}\n"
+            ".vsize{font-size:12px;color:#9ca3af;white-space:nowrap;}\n"
+            ".vbtn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.08);color:#f3f4f6;"
+            "padding:7px 14px;border-radius:9px;font-size:12.5px;font-weight:600;cursor:pointer;"
+            "text-decoration:none;display:inline-flex;align-items:center;gap:7px;font-family:inherit;}\n"
+            ".vbtn.primary{background:linear-gradient(135deg,#4f8cff,#3b5bfc);border-color:transparent;color:#fff;}\n"
+            ".vbtn:hover{filter:brightness(1.15);}\n"
+            ".vplay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;"
+            "z-index:4;background:rgba(0,0,0,.35);cursor:pointer;}\n"
+            ".vplay span{width:84px;height:84px;border-radius:50%;background:rgba(59,130,246,.92);color:#fff;"
+            "font-size:34px;display:flex;align-items:center;justify-content:center;"
+            "box-shadow:0 10px 40px rgba(0,0,0,.5);}\n"
+            ".verr{position:fixed;inset:0;display:none;flex-direction:column;align-items:center;"
+            "justify-content:center;gap:14px;background:#000;color:#e5e7eb;z-index:6;"
+            "text-align:center;padding:24px;font-size:14.5px;}\n"
+            "@media (max-width:600px){.vsize{display:none;}}\n"
+            "</style>\n"
+            "</head>\n"
+            "<body>\n"
+            '<div class="vbar" id="vbar">\n'
+            f'<span class="vname">{name}</span>\n'
+            f'<span class="vsize">{size}</span>\n'
+            '<button class="vbtn" type="button" onclick="closeViewerTab()">Back</button>\n'
+            '<a class="vbtn primary" id="dlBtn" download>&#8681; Download</a>\n'
+            "</div>\n"
+            '<div class="vstage">\n'
+            f'<video id="vv" src="{src}?raw=1" controls autoplay playsinline preload="metadata"></video>\n'
+            "</div>\n"
+            '<div class="vplay" id="vplay"><span>&#9654;</span></div>\n'
+            '<div class="verr" id="verr"><div>This format cannot be played in the browser.</div>\n'
+            '<a class="vbtn primary" id="errDl" download>&#8681; Download file</a></div>\n'
+            "<script>\n"
+            "function closeViewerTab(){\n"
+            "  try{window.close();}catch(e){}\n"
+            "  setTimeout(function(){\n"
+            "    try{ if(!window.closed) history.back(); }catch(e2){\n"
+            "      location.href=location.pathname.replace(/[^/]*$/,'')||'/';\n"
+            "    }\n"
+            "  },80);\n"
+            "}\n"
+            "(function(){\n"
+            "  var nm=" + json.dumps(path.name) + ";\n"
+            "  var a=document.getElementById('dlBtn');\n"
+            "  a.href=location.pathname;\n"
+            "  a.setAttribute('download',nm);\n"
+            "  var e=document.getElementById('errDl');\n"
+            "  e.href=location.pathname;\n"
+            "  e.setAttribute('download',nm);\n"
+            "  var v=document.getElementById('vv');\n"
+            "  var pl=document.getElementById('vplay');\n"
+            "  pl.addEventListener('click',function(){ pl.style.display='none'; v.muted=false; try{v.play();}catch(e3){} });\n"
+            "  v.addEventListener('error',function(){ document.getElementById('verr').style.display='flex'; });\n"
+            "  var p=null; try{ p=v.play(); }catch(e4){}\n"
+            "  if(p&&p.catch){ p.catch(function(){ pl.style.display='flex'; }); }\n"
+            "})();\n"
+            "</script>\n"
+            "</body>\n"
+            "</html>\n"
+        )
+        data = page.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        accept_enc = (self.headers.get("Accept-Encoding") or "").lower()
+        if "gzip" in accept_enc:
+            data = gzip.compress(data, compresslevel=5)
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        return io.BytesIO(data)
 
     def _render_image_viewer(self, path: Path):
         """Serve an image viewer page with a top download button."""
@@ -2266,8 +2372,26 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
                 href = link + "/"
                 dir_files, dir_bytes = _folder_stats(full)
                 dir_stats = f"{dir_files} files &middot; {human_size(dir_bytes)}"
+                perms = _perm_string(full)
+                rel_path = (display_path.rstrip("/") + "/" + name) if display_path != "/" else "/" + name
+                meta = json.dumps({
+                    "name": name,
+                    "href": href,
+                    "size": human_size(dir_bytes),
+                    "sizeB": dir_bytes,
+                    "type": "folder",
+                    "mtime": _fmt_mtime(mtime),
+                    "mtimeTs": int(mtime),
+                    "perm": perms,
+                    "path": rel_path,
+                    "ext": "folder",
+                    "dir": 1,
+                    "files": dir_files,
+                }, ensure_ascii=False)
                 rows.append(
-                    f'<div class="frow dir" data-href="{href}" data-name="{label}" '
+                    f'<div class="frow dir" data-href="{href}" '
+                    f'data-meta="{html.escape(meta, quote=True)}" '
+                    f'data-name="{label}" '
                     f'data-kind="1" data-size="{dir_bytes}" data-mtime="{int(mtime)}" '
                     f'draggable="true" '
                     f'onclick="onRowClick(event, this)" '
@@ -2357,7 +2481,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
 <html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
-<script>try{{var t=localStorage.getItem("bs-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}}catch(e){{}}</script>
+<script>try{{var t=localStorage.getItem("bs-theme");var TH=["dark","light","blue","purple","orange","green","sunset"];if(TH.indexOf(t)>=0)document.documentElement.setAttribute("data-theme",t);}}catch(e){{}}</script>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>Black File Manager - Black Server</title>
@@ -2408,6 +2532,9 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     --scroll-thumb: rgba(79,140,255,.55);
     --scroll-thumb-hover: rgba(109,150,255,.85);
     --scroll-track: rgba(255,255,255,.04);
+    --accent-rgb: 59,130,246;
+    --folder-a: #60a5fa;
+    --folder-b: #3b82f6;
   }}
 
   [data-theme="light"] {{
@@ -2445,9 +2572,89 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     --scroll-thumb: rgba(59,130,246,.45);
     --scroll-thumb-hover: rgba(37,99,235,.75);
     --scroll-track: rgba(0,0,0,.05);
+    --accent-rgb: 59,130,246;
+    --folder-a: #93c5fd;
+    --folder-b: #3b82f6;
   }}
   /* fix typo-safe: real value */
   [data-theme="light"] {{ --switch-bg: #d8dfec; }}
+
+  /* ===== EXTRA THEMES ===== */
+  [data-theme="blue"] {{
+    --bg: #061224; --bg2: #08182f; --panel: #0a1e3c; --panel2: #0d2649; --panel3: #113059;
+    --border: #1a3f70; --border2: #24518c;
+    --text: #e6f2ff; --text2: #8fbaea; --text3: #5c8ac4;
+    --blue: #38a6ff; --blue2: #1f7fd6;
+    --sel: rgba(56,166,255,.16); --sel-border: rgba(56,166,255,.6); --hover: rgba(56,166,255,.08);
+    --shadow: 0 8px 32px rgba(0,0,0,.5);
+    --sidebar-bg: rgba(4,14,30,.4); --details-bg: rgba(4,14,30,.45);
+    --mbar-bg: #0f2c52; --switch-bg: #0f2c52; --switch-knob: #eaf6ff;
+    --glass-bg: rgba(10,30,60,.92); --input-bg: #0a1e3c;
+    --scroll-thumb: rgba(56,166,255,.55); --scroll-thumb-hover: rgba(56,166,255,.85);
+    --scroll-track: rgba(255,255,255,.05);
+    --accent-rgb: 56,166,255;
+    --folder-a: #7dd3fc; --folder-b: #38a6ff;
+  }}
+  [data-theme="purple"] {{
+    --bg: #12071f; --bg2: #180a2b; --panel: #1d0d33; --panel2: #25123f; --panel3: #2e174e;
+    --border: #46206e; --border2: #5b2c8c;
+    --text: #f6eaff; --text2: #b895d8; --text3: #8a63b0;
+    --blue: #c026d3; --blue2: #9d17b0;
+    --sel: rgba(192,38,211,.16); --sel-border: rgba(192,38,211,.6); --hover: rgba(192,38,211,.09);
+    --shadow: 0 8px 32px rgba(0,0,0,.5);
+    --sidebar-bg: rgba(20,7,36,.45); --details-bg: rgba(20,7,36,.5);
+    --mbar-bg: #341856; --switch-bg: #341856; --switch-knob: #fae8ff;
+    --glass-bg: rgba(29,13,51,.92); --input-bg: #1d0d33;
+    --scroll-thumb: rgba(216,80,240,.5); --scroll-thumb-hover: rgba(216,80,240,.8);
+    --scroll-track: rgba(255,255,255,.05);
+    --accent-rgb: 192,38,211;
+    --folder-a: #e879f9; --folder-b: #c026d3;
+  }}
+  [data-theme="orange"] {{
+    --bg: #130c03; --bg2: #1a1205; --panel: #201607; --panel2: #291c09; --panel3: #33230c;
+    --border: #553a12; --border2: #6e4c19;
+    --text: #fdf3e3; --text2: #c9a670; --text3: #9a7743;
+    --blue: #f59e0b; --blue2: #d97706;
+    --sel: rgba(245,158,11,.15); --sel-border: rgba(245,158,11,.6); --hover: rgba(245,158,11,.08);
+    --shadow: 0 8px 32px rgba(0,0,0,.5);
+    --sidebar-bg: rgba(24,15,4,.45); --details-bg: rgba(24,15,4,.5);
+    --mbar-bg: #3a270c; --switch-bg: #3a270c; --switch-knob: #fff7e6;
+    --glass-bg: rgba(32,22,7,.92); --input-bg: #201607;
+    --scroll-thumb: rgba(245,158,11,.5); --scroll-thumb-hover: rgba(245,158,11,.8);
+    --scroll-track: rgba(255,255,255,.05);
+    --accent-rgb: 245,158,11;
+    --folder-a: #fbbf24; --folder-b: #f59e0b;
+  }}
+  [data-theme="green"] {{
+    --bg: #04120b; --bg2: #06180f; --panel: #082015; --panel2: #0b291b; --panel3: #0f3323;
+    --border: #17513a; --border2: #1f6b4c;
+    --text: #e8fdf2; --text2: #86c9a8; --text3: #579c7b;
+    --blue: #22c55e; --blue2: #16a34a;
+    --sel: rgba(34,197,94,.15); --sel-border: rgba(34,197,94,.6); --hover: rgba(34,197,94,.08);
+    --shadow: 0 8px 32px rgba(0,0,0,.5);
+    --sidebar-bg: rgba(3,18,11,.45); --details-bg: rgba(3,18,11,.5);
+    --mbar-bg: #0d3a25; --switch-bg: #0d3a25; --switch-knob: #ecfdf3;
+    --glass-bg: rgba(8,32,21,.92); --input-bg: #082015;
+    --scroll-thumb: rgba(34,197,94,.5); --scroll-thumb-hover: rgba(34,197,94,.8);
+    --scroll-track: rgba(255,255,255,.05);
+    --accent-rgb: 34,197,94;
+    --folder-a: #4ade80; --folder-b: #22c55e;
+  }}
+  [data-theme="sunset"] {{
+    --bg: #150a26; --bg2: #1c0f33; --panel: #22123d; --panel2: #2a1749; --panel3: #331d58;
+    --border: #4b2a7d; --border2: #5f3799;
+    --text: #f7ecff; --text2: #bfa3dd; --text3: #9074b8;
+    --blue: #f59e0b; --blue2: #d97706;
+    --sel: rgba(245,158,11,.15); --sel-border: rgba(245,158,11,.6); --hover: rgba(245,158,11,.08);
+    --shadow: 0 8px 32px rgba(0,0,0,.5);
+    --sidebar-bg: rgba(21,10,38,.45); --details-bg: rgba(21,10,38,.5);
+    --mbar-bg: #3a2160; --switch-bg: #3a2160; --switch-knob: #fff3df;
+    --glass-bg: rgba(34,18,61,.92); --input-bg: #22123d;
+    --scroll-thumb: rgba(245,158,11,.5); --scroll-thumb-hover: rgba(245,158,11,.8);
+    --scroll-track: rgba(255,255,255,.05);
+    --accent-rgb: 245,158,11;
+    --folder-a: #fbbf24; --folder-b: #f59e0b;
+  }}
 
   html {{ font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
          -webkit-font-smoothing: antialiased; }}
@@ -2514,7 +2721,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   .search input::placeholder {{ color: var(--text3); }}
   .search input:focus {{
     border-color: var(--blue);
-    box-shadow: 0 0 0 3px rgba(59,130,246,.2);
+    box-shadow: 0 0 0 3px rgba(var(--accent-rgb), .2);
   }}
   .search-scope {{
     position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
@@ -2558,7 +2765,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   }}
   .scope-menu button + button {{ border-top: 1px solid var(--border); }}
   .scope-menu button:hover {{ background: var(--hover); color: var(--text); }}
-  .scope-menu button.on {{ background: rgba(59,130,246,.12); color: var(--text); }}
+  .scope-menu button.on {{ background: rgba(var(--accent-rgb), .12); color: var(--text); }}
   .sm-icon {{
     width: 32px; height: 32px; border-radius: 9px; flex-shrink: 0;
     background: var(--panel3); border: 1px solid var(--border);
@@ -2566,7 +2773,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     font-size: 15px;
   }}
   .scope-menu button.on .sm-icon {{
-    background: rgba(59,130,246,.2); border-color: rgba(59,130,246,.45);
+    background: rgba(var(--accent-rgb), .2); border-color: rgba(var(--accent-rgb), .45);
   }}
   .sm-text {{ display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }}
   .sm-title {{ font-size: 13px; font-weight: 700; color: var(--text); }}
@@ -2580,65 +2787,63 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     margin-left: auto; display: flex; align-items: center; gap: 12px;
   }}
 
-  /* ===== THEME DRAWER SWITCH ===== */
-  .theme-switch {{
-    position: relative; width: 64px; height: 34px; flex-shrink: 0;
+  /* ===== THEME PICKER BUTTON + MENU ===== */
+  .theme-wrap {{ position: relative; flex-shrink: 0; }}
+  .theme-btn {{
+    display: flex; align-items: center; gap: 7px;
+    height: 34px; padding: 0 12px;
     background: var(--switch-bg);
     border: 1px solid var(--border);
     border-radius: 999px; cursor: pointer;
+    color: var(--text); font-family: inherit;
     box-shadow: inset 0 2px 6px rgba(0,0,0,.25);
-    transition: background .4s cubic-bezier(.4,0,.2,1),
-                border-color .4s ease, box-shadow .4s ease;
-    padding: 0; outline: none;
+    transition: background .3s ease, border-color .3s ease, box-shadow .3s ease;
+    outline: none;
   }}
-  [data-theme="light"] .theme-switch {{
-    box-shadow: inset 0 2px 6px rgba(20,35,70,.12);
+  .theme-btn:hover {{
+    border-color: rgba(var(--accent-rgb), .55);
+    box-shadow: 0 0 0 3px rgba(var(--accent-rgb), .16);
   }}
-  .theme-switch .knob {{
-    position: absolute; top: 3px; left: 3px;
-    width: 26px; height: 26px; border-radius: 50%;
-    background: var(--switch-knob);
-    box-shadow: 0 2px 8px rgba(0,0,0,.3);
-    display: flex; align-items: center; justify-content: center;
-    font-size: 13px; line-height: 1;
-    transition: transform .45s cubic-bezier(.34,1.4,.5,1),
-                background .4s ease, box-shadow .4s ease;
-    z-index: 2;
+  .theme-btn .ti {{ font-size: 15px; line-height: 1; }}
+  .theme-btn .tcaret {{
+    font-size: 10px; color: var(--text3);
+    transition: transform .2s ease;
   }}
-  [data-theme="light"] .theme-switch .knob {{
-    transform: translateX(30px);
-    box-shadow: 0 2px 10px rgba(20,35,70,.2);
+  .theme-wrap.open .theme-btn .tcaret {{ transform: rotate(180deg); }}
+  .theme-menu {{
+    position: absolute; top: calc(100% + 10px); right: 0;
+    min-width: 190px; padding: 6px;
+    background: var(--glass-bg); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    border: 1px solid var(--border2); border-radius: 14px;
+    box-shadow: var(--shadow);
+    display: none; z-index: 40;
   }}
-  .theme-switch .icon-moon, .theme-switch .icon-sun {{
-    position: absolute; top: 50%; transform: translateY(-50%);
-    font-size: 12px; opacity: .55;
-    transition: opacity .35s ease, transform .45s cubic-bezier(.34,1.4,.5,1);
-    pointer-events: none;
+  .theme-menu.open {{ display: block; animation: menuIn .16s cubic-bezier(.16,1,.3,1); }}
+  @keyframes menuIn {{
+    from {{ opacity: 0; transform: translateY(-6px); }}
+    to {{ opacity: 1; transform: translateY(0); }}
   }}
-  .theme-switch .icon-sun {{ right: 9px; opacity: 0; transform: translateY(-50%) rotate(-90deg) scale(.5); }}
-  .theme-switch .icon-moon {{ left: 9px; opacity: .7; }}
-  [data-theme="light"] .theme-switch .icon-sun {{
-    opacity: .75; transform: translateY(-50%) rotate(0deg) scale(1);
+  .theme-menu button {{
+    display: flex; align-items: center; gap: 10px;
+    width: 100%; padding: 9px 10px;
+    border: none; background: transparent; border-radius: 10px;
+    color: var(--text2); font-size: 13px; font-weight: 600;
+    font-family: inherit; cursor: pointer; text-align: left;
+    transition: background .12s, color .12s;
   }}
-  [data-theme="light"] .theme-switch .icon-moon {{
-    opacity: 0; transform: translateY(-50%) rotate(90deg) scale(.5);
+  .theme-menu button:hover {{ background: var(--hover); color: var(--text); }}
+  .theme-menu button.on {{ background: rgba(var(--accent-rgb), .16); color: var(--text); }}
+  .tsw {{
+    width: 20px; height: 20px; border-radius: 50%; flex-shrink: 0;
+    border: 1px solid rgba(255,255,255,.25);
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,.2);
   }}
-  .theme-switch:hover .knob {{ box-shadow: 0 3px 12px rgba(59,130,246,.4); }}
-  .theme-switch:active .knob {{ width: 30px; }}
-  [data-theme="light"] .theme-switch:active .knob {{
-    transform: translateX(26px); width: 30px;
+  .tnm {{ flex: 1; min-width: 0; }}
+  .tck {{
+    font-size: 13px; font-weight: 800; color: var(--blue);
+    opacity: 0; transform: scale(.5); transition: all .15s;
   }}
-  /* soft sliding track glow */
-  .theme-switch::after {{
-    content: ""; position: absolute; inset: 3px;
-    border-radius: 999px; pointer-events: none;
-    background: linear-gradient(90deg, rgba(59,130,246,.35), transparent 55%);
-    opacity: 1; transition: opacity .4s ease, transform .45s ease;
-  }}
-  [data-theme="light"] .theme-switch::after {{
-    background: linear-gradient(90deg, transparent, rgba(245,158,11,.4));
-    opacity: 1;
-  }}
+  .theme-menu button.on .tck, .set-themes button.on .tck {{ opacity: 1; transform: scale(1); }}
 
   .machine {{
     display: flex; align-items: center; gap: 10px;
@@ -2730,13 +2935,13 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   }}
   .btn:hover {{ background: var(--panel3); border-color: var(--blue); }}
   .btn.primary {{
-    background: linear-gradient(135deg, #4f8cff 0%, #3b5bfc 50%, #6d4df6 100%);
+    background: linear-gradient(135deg, var(--folder-a) 0%, var(--blue) 50%, var(--blue2) 100%);
     border: none; color: #fff;
-    box-shadow: 0 4px 18px rgba(79,140,255,.35);
+    box-shadow: 0 4px 18px rgba(var(--accent-rgb),.35);
   }}
   .btn.primary:hover {{
     transform: translateY(-1px);
-    box-shadow: 0 6px 22px rgba(79,140,255,.5);
+    box-shadow: 0 6px 22px rgba(var(--accent-rgb),.5);
   }}
 
   /* ===== 3-COLUMN LAYOUT ===== */
@@ -2947,7 +3152,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   .frow.selected {{
     background: var(--sel);
     border-color: var(--sel-border);
-    box-shadow: 0 0 0 1px var(--sel-border), 0 4px 16px rgba(59,130,246,.15);
+    box-shadow: 0 0 0 1px var(--sel-border), 0 4px 16px rgba(var(--accent-rgb), .15);
   }}
   .fchk {{
     display: flex; align-items: center; justify-content: center;
@@ -2967,12 +3172,12 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   }}
   .fchk .chk:hover {{
     border-color: var(--blue);
-    box-shadow: 0 0 0 3px rgba(59,130,246,.18);
+    box-shadow: 0 0 0 3px rgba(var(--accent-rgb),.18);
   }}
   .fchk .chk:checked {{
-    background: linear-gradient(135deg, #4f8cff, #3b5bfc);
+    background: linear-gradient(135deg, var(--blue), var(--blue2));
     border-color: transparent;
-    box-shadow: 0 2px 8px rgba(59,130,246,.4);
+    box-shadow: 0 2px 8px rgba(var(--accent-rgb),.4);
   }}
   .fchk .chk:checked::after {{
     content: "";
@@ -3001,12 +3206,12 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   }}
   .thead .fchk input:hover {{
     border-color: var(--blue);
-    box-shadow: 0 0 0 3px rgba(59,130,246,.18);
+    box-shadow: 0 0 0 3px rgba(var(--accent-rgb),.18);
   }}
   .thead .fchk input:checked {{
-    background: linear-gradient(135deg, #4f8cff, #3b5bfc);
+    background: linear-gradient(135deg, var(--blue), var(--blue2));
     border-color: transparent;
-    box-shadow: 0 2px 8px rgba(59,130,246,.4);
+    box-shadow: 0 2px 8px rgba(var(--accent-rgb),.4);
   }}
   .thead .fchk input:checked::after {{
     content: "";
@@ -3085,7 +3290,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   .badge.exe  {{ background: linear-gradient(135deg,#94a3b8,#64748b); font-size: 9px; }}
   .badge.file {{ background: linear-gradient(135deg,#64748b,#475569); font-size: 9px; }}
   .badge.folder {{
-    background: linear-gradient(135deg,#60a5fa,#3b82f6);
+    background: linear-gradient(135deg,var(--folder-a),var(--folder-b));
     font-size: 16px;
   }}
 
@@ -3137,7 +3342,8 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   .detail-icon.css  {{ background: linear-gradient(135deg,#38bdf8,#0284c7); }}
   .detail-icon.js   {{ background: linear-gradient(135deg,#facc15,#eab308); color:#1a1a1a; }}
   .detail-icon.file {{ background: linear-gradient(135deg,#64748b,#475569); }}
-  .detail-icon.folder {{ background: linear-gradient(135deg,#60a5fa,#3b82f6); }}
+  .detail-icon.folder {{ background: linear-gradient(135deg,var(--folder-a),var(--folder-b)); }}
+  .detail-icon.vid {{ background: linear-gradient(135deg,#f472b6,#ec4899); }}
   .detail-name {{
     font-size: 17px; font-weight: 700; word-break: break-all;
   }}
@@ -3188,8 +3394,8 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     box-shadow: none !important;
   }}
   .dl-btn.blue {{
-    background: linear-gradient(135deg, #60a5fa 0%, #3b82f6 55%, #2563eb 100%);
-    box-shadow: 0 6px 20px rgba(59,130,246,.4);
+    background: linear-gradient(135deg, var(--folder-a) 0%, var(--blue) 55%, var(--blue2) 100%);
+    box-shadow: 0 6px 20px rgba(var(--accent-rgb),.4);
   }}
   .dl-btn.teal {{
     background: linear-gradient(135deg, #2dd4bf 0%, #14b8a6 55%, #0d9488 100%);
@@ -3380,6 +3586,27 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   .set-seg button.on {{
     background: var(--blue); color: #fff;
   }}
+  .set-themes {{
+    display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end;
+    max-width: 340px; flex-shrink: 0;
+  }}
+  .set-themes button {{
+    display: flex; align-items: center; gap: 7px;
+    padding: 6px 10px;
+    background: var(--input-bg); border: 1px solid var(--border);
+    border-radius: 999px; color: var(--text3);
+    font-size: 12px; font-weight: 600; font-family: inherit;
+    cursor: pointer; transition: all .15s;
+  }}
+  .set-themes button:hover {{
+    border-color: var(--blue); color: var(--text);
+  }}
+  .set-themes button.on {{
+    background: rgba(var(--accent-rgb), .16);
+    border-color: rgba(var(--accent-rgb), .65);
+    color: var(--text);
+  }}
+  .set-themes .tsw {{ width: 15px; height: 15px; }}
   .set-badge {{
     font-size: 11px; font-weight: 700; color: var(--green);
     background: rgba(34,197,94,.12); border: 1px solid rgba(34,197,94,.3);
@@ -3443,7 +3670,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   }}
   .up-bar > i {{
     display: block; height: 100%; width: 0%;
-    background: linear-gradient(90deg, #4f8cff, #3b5bfc);
+    background: linear-gradient(90deg, var(--blue), var(--blue2));
     border-radius: 999px; transition: width .15s linear;
   }}
   .up-meta {{
@@ -3468,7 +3695,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     border-color: var(--blue);
     background: var(--sel);
     transform: translateY(-4px);
-    box-shadow: 0 10px 28px rgba(59,130,246,.2);
+    box-shadow: 0 10px 28px rgba(var(--accent-rgb),.2);
   }}
   .choice:active {{ transform: translateY(-1px); }}
   .choice .cico {{
@@ -3477,7 +3704,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     font-size: 24px; color: #fff;
     box-shadow: 0 6px 18px rgba(0,0,0,.25);
   }}
-  .choice .cico.folder {{ background: linear-gradient(135deg,#60a5fa,#3b82f6); }}
+  .choice .cico.folder {{ background: linear-gradient(135deg,var(--folder-a),var(--folder-b)); }}
   .choice .cico.file {{ background: linear-gradient(135deg,#a78bfa,#7c3aed); }}
   .choice .clabel {{ font-size: 14px; font-weight: 700; }}
   .choice .cdesc {{ font-size: 11px; color: var(--text3); }}
@@ -3497,7 +3724,7 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   }}
   .field-input:focus {{
     border-color: var(--blue);
-    box-shadow: 0 0 0 3px rgba(59,130,246,.2);
+    box-shadow: 0 0 0 3px rgba(var(--accent-rgb),.2);
   }}
   .field-hint {{
     font-size: 11.5px; color: var(--text3); margin-top: 8px;
@@ -3509,11 +3736,11 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
   .modal-actions .btn {{ flex: 1; justify-content: center; padding: 11px 14px; }}
   .btn.ghost {{ background: transparent; }}
   .btn.ok {{
-    background: linear-gradient(135deg, #4f8cff, #3b5bfc);
+    background: linear-gradient(135deg, var(--blue), var(--blue2));
     border: none; color: #fff;
-    box-shadow: 0 4px 16px rgba(79,140,255,.35);
+    box-shadow: 0 4px 16px rgba(var(--accent-rgb),.35);
   }}
-  .btn.ok:hover {{ transform: translateY(-1px); box-shadow: 0 6px 20px rgba(79,140,255,.5); }}
+  .btn.ok:hover {{ transform: translateY(-1px); box-shadow: 0 6px 20px rgba(var(--accent-rgb),.5); }}
   .btn[disabled] {{ opacity: .5; pointer-events: none; }}
   .spinner {{
     display: inline-block; width: 14px; height: 14px;
@@ -3610,12 +3837,43 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     </div>
   </div>
   <div class="top-right">
-    <button class="theme-switch" id="themeSwitch" title="Toggle theme"
-            onclick="toggleTheme()" aria-label="Toggle theme">
-      <span class="icon-moon">&#9789;</span>
-      <span class="icon-sun">&#9728;</span>
-      <span class="knob" id="themeKnob">&#127769;</span>
-    </button>
+    <div class="theme-wrap" id="themeWrap">
+      <button class="theme-btn" id="themeSwitch" title="Themes"
+              onclick="toggleTheme(event)" aria-label="Themes">
+        <span class="ti">&#127912;</span>
+        <span class="tcaret">&#9662;</span>
+      </button>
+      <div class="theme-menu" id="themeMenu">
+        <button data-t="dark" onclick="setTheme('dark')">
+          <span class="tsw" style="background:linear-gradient(135deg,#070b14,#3b82f6)"></span>
+          <span class="tnm">تیره</span><span class="tck">&#10003;</span>
+        </button>
+        <button data-t="light" onclick="setTheme('light')">
+          <span class="tsw" style="background:linear-gradient(135deg,#ffffff,#93c5fd)"></span>
+          <span class="tnm">روشن</span><span class="tck">&#10003;</span>
+        </button>
+        <button data-t="blue" onclick="setTheme('blue')">
+          <span class="tsw" style="background:linear-gradient(135deg,#061224,#38a6ff)"></span>
+          <span class="tnm">آبی</span><span class="tck">&#10003;</span>
+        </button>
+        <button data-t="purple" onclick="setTheme('purple')">
+          <span class="tsw" style="background:linear-gradient(135deg,#12071f,#c026d3)"></span>
+          <span class="tnm">بنفش</span><span class="tck">&#10003;</span>
+        </button>
+        <button data-t="orange" onclick="setTheme('orange')">
+          <span class="tsw" style="background:linear-gradient(135deg,#130c03,#f59e0b)"></span>
+          <span class="tnm">نارنجی</span><span class="tck">&#10003;</span>
+        </button>
+        <button data-t="green" onclick="setTheme('green')">
+          <span class="tsw" style="background:linear-gradient(135deg,#04120b,#22c55e)"></span>
+          <span class="tnm">سبز</span><span class="tck">&#10003;</span>
+        </button>
+        <button data-t="sunset" onclick="setTheme('sunset')">
+          <span class="tsw" style="background:linear-gradient(135deg,#150a26,#f59e0b)"></span>
+          <span class="tnm">غروب</span><span class="tck">&#10003;</span>
+        </button>
+      </div>
+    </div>
     <div class="machine">
       <span class="mdot"></span>
       <div class="mtext">
@@ -3877,11 +4135,37 @@ class DownloadRequestHandler(SimpleHTTPRequestHandler):
     <div class="set-row">
       <div class="set-info">
         <div class="st">تم رابط کاربری</div>
-        <div class="ss">روشن یا تیره — با انیمیشن نرم</div>
+        <div class="ss">هر تمی را انتخاب کنید — با انیمیشن نرم</div>
       </div>
-      <div class="set-seg">
-        <button id="setDark" class="on" onclick="setTheme('dark')">&#9789; تیره</button>
-        <button id="setLight" onclick="setTheme('light')">&#9728; روشن</button>
+      <div class="set-themes">
+        <button id="setDark" data-t="dark" onclick="setTheme('dark')">
+          <span class="tsw" style="background:linear-gradient(135deg,#070b14,#3b82f6)"></span>
+          <span class="tnm">تیره</span><span class="tck">&#10003;</span>
+        </button>
+        <button id="setLight" data-t="light" onclick="setTheme('light')">
+          <span class="tsw" style="background:linear-gradient(135deg,#ffffff,#93c5fd)"></span>
+          <span class="tnm">روشن</span><span class="tck">&#10003;</span>
+        </button>
+        <button data-t="blue" onclick="setTheme('blue')">
+          <span class="tsw" style="background:linear-gradient(135deg,#061224,#38a6ff)"></span>
+          <span class="tnm">آبی</span><span class="tck">&#10003;</span>
+        </button>
+        <button data-t="purple" onclick="setTheme('purple')">
+          <span class="tsw" style="background:linear-gradient(135deg,#12071f,#c026d3)"></span>
+          <span class="tnm">بنفش</span><span class="tck">&#10003;</span>
+        </button>
+        <button data-t="orange" onclick="setTheme('orange')">
+          <span class="tsw" style="background:linear-gradient(135deg,#130c03,#f59e0b)"></span>
+          <span class="tnm">نارنجی</span><span class="tck">&#10003;</span>
+        </button>
+        <button data-t="green" onclick="setTheme('green')">
+          <span class="tsw" style="background:linear-gradient(135deg,#04120b,#22c55e)"></span>
+          <span class="tnm">سبز</span><span class="tck">&#10003;</span>
+        </button>
+        <button data-t="sunset" onclick="setTheme('sunset')">
+          <span class="tsw" style="background:linear-gradient(135deg,#150a26,#f59e0b)"></span>
+          <span class="tnm">غروب</span><span class="tck">&#10003;</span>
+        </button>
       </div>
     </div>
     <div class="set-row">
@@ -4007,12 +4291,16 @@ function applyMeta(m) {{
   SELECTED = m;
   var icon = document.getElementById("dIcon");
   var ext = (m.ext || "file").toLowerCase();
+  var isDir = !!(m.dir || ext === "folder" || m.type === "folder");
   var map = {{html:"</>", css:"#", js:"JS", json:"{{}}", md:"MD", txt:"TXT",
               png:"IMG", jpg:"IMG", jpeg:"IMG", gif:"IMG", ico:"&#9733;",
-              pdf:"PDF", zip:"ZIP", py:"PY"}};
+              pdf:"PDF", zip:"ZIP", py:"PY",
+              mp4:"&#9654;", webm:"&#9654;", mov:"&#9654;", mkv:"&#9654;",
+              avi:"&#9654;", m4v:"&#9654;", folder:"&#128193;"}};
   var cls = {{html:"html", css:"css", js:"js", css:"css"}};
   var badgeCls = "file";
-  if (ext === "html" || ext === "htm") badgeCls = "html";
+  if (isDir) badgeCls = "folder";
+  else if (ext === "html" || ext === "htm") badgeCls = "html";
   else if (ext === "css") badgeCls = "css";
   else if (ext === "js") badgeCls = "js";
   else if (ext === "json") badgeCls = "json";
@@ -4020,15 +4308,24 @@ function applyMeta(m) {{
   else if (ext === "zip" || ext === "rar" || ext === "7z") badgeCls = "zip";
   else if (ext === "pdf") badgeCls = "pdf";
   else if (ext === "png" || ext === "jpg" || ext === "jpeg" || ext === "gif") badgeCls = "html";
+  else if (ext === "mp4" || ext === "webm" || ext === "ogg" || ext === "ogv"
+           || ext === "mov" || ext === "mkv" || ext === "avi" || ext === "m4v"
+           || ext === "flv" || ext === "wmv") badgeCls = "vid";
   icon.className = "detail-icon " + badgeCls;
   icon.innerHTML = map[ext] || "&#128196;";
   document.getElementById("dName").textContent = m.name;
-  document.getElementById("dPath").textContent = m.path;
-  document.getElementById("dSize").textContent = m.size;
-  document.getElementById("dType").textContent = m.type;
-  document.getElementById("dMod").textContent = m.mtime;
-  document.getElementById("dPerm").textContent = m.perm;
-  document.getElementById("dlSub1").textContent = "Get " + m.name + " (" + m.size + ")";
+  var dp = document.getElementById("dPath");
+  if (dp) {{
+    if (isDir) {{ dp.style.display = "none"; dp.textContent = ""; }}
+    else {{ dp.style.display = ""; dp.textContent = m.path || ""; }}
+  }}
+  document.getElementById("dSize").textContent = m.size || "\u2014";
+  document.getElementById("dType").textContent = m.type || "\u2014";
+  document.getElementById("dMod").textContent = m.mtime || "\u2014";
+  document.getElementById("dPerm").textContent = m.perm || "\u2014";
+  document.getElementById("dlSub1").textContent = isDir
+    ? "Get " + m.name + " as ZIP"
+    : "Get " + m.name + (m.size ? " (" + m.size + ")" : "");
   document.getElementById("dlSub2").textContent = "Download " + m.name + " as ZIP";
 }}
 
@@ -4192,6 +4489,8 @@ function updateSelectionUI() {{
     }}
     if (dName) dName.textContent = n + " items selected";
     if (dIcon) {{ dIcon.className = "detail-icon file"; dIcon.innerHTML = "&#128193;"; }}
+    var dPathEl = document.getElementById("dPath");
+    if (dPathEl) dPathEl.style.display = "none";
     if (sub1) sub1.textContent = "Disabled for multi-select";
     if (sub2) sub2.textContent = "ZIP " + n + " items";
     var dSize = document.getElementById("dSize");
@@ -4209,7 +4508,7 @@ function updateSelectionUI() {{
       btnDownload.removeAttribute("aria-disabled");
     }}
     var row = getCheckedRows()[0];
-    if (row && row.classList.contains("file")) {{
+    if (row && row.getAttribute("data-meta")) {{
       try {{ applyMeta(JSON.parse(row.getAttribute("data-meta"))); }} catch (e) {{}}
     }} else if (row) {{
       if (dName) dName.textContent = row.getAttribute("data-name") || "";
@@ -4230,6 +4529,7 @@ function updateSelectionUI() {{
 }}
 
 var IMG_EXT = {{png:1,jpg:1,jpeg:1,gif:1,webp:1,svg:1,ico:1,bmp:1,avif:1}};
+var VID_EXT = {{mp4:1,webm:1,ogg:1,ogv:1,mov:1,mkv:1,avi:1,m4v:1,flv:1,wmv:1}};
 var TEXT_EXT = {{txt:1,html:1,htm:1,css:1,js:1,json:1,md:1,py:1,xml:1,yml:1,yaml:1,
   csv:1,log:1,sh:1,bat:1,ps1:1,ts:1,jsx:1,tsx:1,vue:1,php:1,java:1,c:1,cpp:1,h:1,
   go:1,rs:1,sql:1,ini:1,cfg:1,conf:1,toml:1,env:1,txt:1,rb:1,pl:1,r:1,m:1,swift:1,
@@ -4249,6 +4549,8 @@ function openFileRow(row) {{
   var ext = (meta.ext || "").toLowerCase();
   var sep = href.indexOf("?") >= 0 ? "&" : "?";
   if (IMG_EXT[ext]) {{
+    window.open(href + sep + "inline=1", "_blank");
+  }} else if (VID_EXT[ext]) {{
     window.open(href + sep + "inline=1", "_blank");
   }} else {{
     window.open(href + sep + "edit=1", "_blank");
@@ -4445,7 +4747,12 @@ function runServerSearch(q) {{
         var isDir = it.kind === 1;
         var sub = isDir ? "Folder" : "File";
         if (isDir) {{
-          return '<div class="frow dir" data-href="' + it.href + '" data-name="' + escapeHtml(it.name) + '" ' +
+          var dmeta = JSON.stringify({{
+            name: it.name, href: it.href, size: "", sizeB: 0,
+            type: "folder", mtime: "", mtimeTs: 0, perm: "",
+            path: it.path, ext: "folder", dir: 1
+          }});
+          return '<div class="frow dir" data-href="' + it.href + '" data-meta="' + escapeHtml(dmeta) + '" data-name="' + escapeHtml(it.name) + '" ' +
             'data-kind="1" data-size="-1" data-mtime="0" draggable="true" ' +
             'onclick="onRowClick(event, this)" ' +
             'ondblclick="onRowDblClick(event, this)" ' +
@@ -4521,6 +4828,7 @@ document.addEventListener("click", function() {{
   document.getElementById("sortMenu").classList.remove("open");
   closeScopeMenu();
   closeRowMenu();
+  closeThemeMenu();
 }});
 
 function sortRows(key, btn) {{
@@ -4681,24 +4989,34 @@ function toast(msg) {{
   toastTimer = setTimeout(function() {{ el.classList.remove("show"); }}, 2400);
 }}
 
-/* ===== THEME DRAWER SWITCH ===== */
+/* ===== THEME PICKER ===== */
+var THEMES = ["dark", "light", "blue", "purple", "orange", "green", "sunset"];
+function isTheme(v) {{ return THEMES.indexOf(v) >= 0; }}
 (function initTheme() {{
   var t = localStorage.getItem("bs-theme");
-  if (t !== "light" && t !== "dark") t = "dark";
+  if (!isTheme(t)) t = "dark";
   document.documentElement.setAttribute("data-theme", t);
-  updateThemeKnob();
+  markThemeUI();
 }})();
-function toggleTheme() {{
-  var el = document.documentElement;
-  var cur = el.getAttribute("data-theme") === "light" ? "dark" : "light";
-  el.setAttribute("data-theme", cur);
-  localStorage.setItem("bs-theme", cur);
-  updateThemeKnob();
+function toggleTheme(e) {{
+  if (e) e.stopPropagation();
+  var w = document.getElementById("themeWrap");
+  var m = document.getElementById("themeMenu");
+  var open = !m.classList.contains("open");
+  m.classList.toggle("open", open);
+  if (w) w.classList.toggle("open", open);
 }}
-function updateThemeKnob() {{
+function closeThemeMenu() {{
+  var w = document.getElementById("themeWrap");
+  var m = document.getElementById("themeMenu");
+  if (m) m.classList.remove("open");
+  if (w) w.classList.remove("open");
+}}
+function markThemeUI() {{
   var t = document.documentElement.getAttribute("data-theme");
-  var k = document.getElementById("themeKnob");
-  if (k) k.innerHTML = t === "light" ? "&#9728;" : "&#127769;";
+  document.querySelectorAll("[data-t]").forEach(function(b) {{
+    b.classList.toggle("on", b.getAttribute("data-t") === t);
+  }});
 }}
 
 /* ===== UPLOAD ===== */
@@ -4885,6 +5203,7 @@ document.addEventListener("keydown", function(e) {{
     closeNewModal(); closeNameModal();
     closeDelModal(); closeRenModal(); closeDestModal(); closeSettings();
     closeRowMenu();
+    closeThemeMenu();
     if (_upXhr) cancelUpload();
     else if (document.getElementById("upModal").classList.contains("open")
              && document.getElementById("upCloseBtn").style.display !== "none") closeUploadModal();
@@ -5283,18 +5602,17 @@ function closeSettings() {{
   if (m) m.classList.remove("open");
 }}
 function syncSettingsUI() {{
-  var th = document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
-  document.getElementById("setDark").classList.toggle("on", th === "dark");
-  document.getElementById("setLight").classList.toggle("on", th === "light");
+  markThemeUI();
   var v = "list";
   try {{ v = localStorage.getItem("bs-view") || "list"; }} catch (e) {{}}
   document.getElementById("setListV").classList.toggle("on", v !== "grid");
   document.getElementById("setGridV").classList.toggle("on", v === "grid");
 }}
 function setTheme(t) {{
+  if (!isTheme(t)) t = "dark";
   document.documentElement.setAttribute("data-theme", t);
   try {{ localStorage.setItem("bs-theme", t); }} catch (e) {{}}
-  updateThemeKnob();
+  markThemeUI();
   syncSettingsUI();
 }}
 function setPrefView(v) {{
@@ -5322,6 +5640,25 @@ function setPrefView(v) {{
 # Server lifecycle
 # ---------------------------------------------------------------------------
 
+class QuietThreadingHTTPServer(ThreadingHTTPServer):
+    """Threaded HTTP server that swallows benign connection errors.
+
+    Browsers (and Cloudflare tunnel keep-alives) routinely close idle or
+    in-flight connections; the worker thread then raises
+    ``ConnectionResetError``/``BrokenPipeError`` while reading the next
+    request and the default ``handle_error`` would dump a full traceback
+    to the console for every dropped connection.
+    """
+
+    daemon_threads = True
+
+    def handle_error(self, request, client_address) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def create_http_server(preferred_port: int) -> Tuple[ThreadingHTTPServer, int]:
     """Create the threaded HTTP server bound to localhost on a free port."""
     handler = functools.partial(
@@ -5334,7 +5671,7 @@ def create_http_server(preferred_port: int) -> Tuple[ThreadingHTTPServer, int]:
 
     for port in candidates:
         try:
-            httpd = ThreadingHTTPServer((HOST, port), handler)
+            httpd = QuietThreadingHTTPServer((HOST, port), handler)
         except OSError as exc:
             last_error = exc
             logger.warning("Port %s is not available: %s", port, exc)
